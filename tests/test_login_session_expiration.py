@@ -15,6 +15,36 @@ web_outlook_app = importlib.import_module('web_outlook_app')
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
+class FakePocketIdClient:
+    def __init__(self, userinfo=None):
+        self.userinfo = userinfo or {
+            'sub': 'pocket-user-123',
+            'email': 'user@example.com',
+            'preferred_username': 'Pocket User',
+        }
+        self.redirect_uri = None
+        self.state = None
+
+    def authorize_redirect(self, redirect_uri, **kwargs):
+        self.redirect_uri = redirect_uri
+        self.state = kwargs.get('state')
+        return web_outlook_app.redirect(
+            f'https://sso.jackyccc.com/authorize?state={self.state}'
+        )
+
+    def authorize_access_token(self):
+        return {
+            'userinfo': self.userinfo,
+            'id_token': 'validated-by-authlib-in-production',
+            'access_token': 'test-token',
+        }
+
+
+class MissingIdTokenClient(FakePocketIdClient):
+    def authorize_access_token(self):
+        return {'userinfo': self.userinfo, 'access_token': 'untrusted-token'}
+
+
 class LoginSessionExpirationTests(unittest.TestCase):
     def setUp(self):
         self.app = web_outlook_app.app
@@ -26,29 +56,16 @@ class LoginSessionExpirationTests(unittest.TestCase):
 
         with self.app.app_context():
             web_outlook_app.init_db()
-            self.previous_password = web_outlook_app.get_setting('login_password')
             self.previous_version = web_outlook_app.get_setting(
                 web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
-            )
-            web_outlook_app.set_setting(
-                'login_password',
-                web_outlook_app.hash_password('login-test-password'),
             )
             web_outlook_app.set_setting(
                 web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
                 web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
             )
-            web_outlook_app.login_attempts.clear()
-            web_outlook_app.extension_login_tokens.clear()
 
     def tearDown(self):
         with self.app.app_context():
-            if self.previous_password is None:
-                web_outlook_app.get_db().execute(
-                    "DELETE FROM settings WHERE key = 'login_password'"
-                )
-            else:
-                web_outlook_app.set_setting('login_password', self.previous_password)
             if self.previous_version is None:
                 web_outlook_app.get_db().execute(
                     'DELETE FROM settings WHERE key = ?',
@@ -60,209 +77,181 @@ class LoginSessionExpirationTests(unittest.TestCase):
                     self.previous_version,
                 )
             web_outlook_app.get_db().commit()
-            web_outlook_app.login_attempts.clear()
-            web_outlook_app.extension_login_tokens.clear()
         self.app.config['TESTING'] = self.previous_testing
         if self.previous_csrf_enabled is None:
             self.app.config.pop('WTF_CSRF_ENABLED', None)
         else:
             self.app.config['WTF_CSRF_ENABLED'] = self.previous_csrf_enabled
 
+    def oidc_config(self, client=None):
+        return patch.multiple(
+            web_outlook_app,
+            POCKET_ID_URL='https://sso.jackyccc.com',
+            POCKET_ID_CLIENT_ID='test-client-id',
+            POCKET_ID_CLIENT_SECRET='test-client-secret',
+            POCKET_ID_REDIRECT_URI='https://mail.example.com/auth/pocket-id/callback',
+            POCKET_ID_SCOPES='openid profile email',
+            pocket_id_oidc_client=client or FakePocketIdClient(),
+        )
+
     def _login(self, client, now, duration=None):
-        payload = {'password': 'login-test-password'}
-        if duration is not None:
-            payload['session_duration_days'] = duration
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=now):
-            response = client.post('/login', json=payload)
-        return response
+        state = 'test-state'
+        with client.session_transaction() as login_session:
+            login_session['pocket_id_login_contexts'] = {
+                state: {
+                    'duration_days': (
+                        web_outlook_app.DEFAULT_LOGIN_SESSION_DURATION_DAYS
+                        if duration is None
+                        else duration
+                    ),
+                    'next_path': '/',
+                },
+            }
+        with self.oidc_config(), patch.object(
+            web_outlook_app,
+            'get_login_session_now',
+            return_value=now,
+        ):
+            return client.get(f'/auth/pocket-id/callback?state={state}')
+
+    def test_login_page_has_only_pocket_id_login_control(self):
+        response = self.client.get('/login')
+        self.assertEqual(response.status_code, 200)
+        source = response.get_data(as_text=True)
+
+        self.assertNotIn('请输入密码登录系统', source)
+        self.assertNotIn('登录密码', source)
+        self.assertNotIn('type="password"', source)
+        self.assertIn('action="/auth/pocket-id"', source)
+        self.assertIn('>登 录</button>', source)
+        self.assertEqual(self.client.post('/login', json={'password': 'anything'}).status_code, 405)
+
+    def test_pocket_id_start_uses_configured_callback_and_duration(self):
+        fake_client = FakePocketIdClient()
+        with self.oidc_config(fake_client):
+            response = self.client.get(
+                '/auth/pocket-id?session_duration_days=90&next=/%23settings',
+                follow_redirects=False,
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers['Location'].startswith('https://sso.jackyccc.com/authorize?state='))
+        self.assertEqual(
+            fake_client.redirect_uri,
+            'https://mail.example.com/auth/pocket-id/callback',
+        )
+        self.assertTrue(fake_client.state)
+        with self.client.session_transaction() as login_session:
+            context = login_session['pocket_id_login_contexts'][fake_client.state]
+            self.assertEqual(context['duration_days'], 90)
+            self.assertEqual(context['next_path'], '/#settings')
+
+    def test_missing_pocket_id_configuration_returns_to_login(self):
+        with patch.multiple(
+            web_outlook_app,
+            POCKET_ID_CLIENT_ID='',
+            pocket_id_oidc_client=None,
+        ):
+            response = self.client.get('/auth/pocket-id', follow_redirects=False)
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers['Location'].endswith('/login?error=configuration'))
+
+    def test_callback_rejects_token_response_without_id_token(self):
+        state = 'missing-id-token-state'
+        with self.client.session_transaction() as login_session:
+            login_session['pocket_id_login_contexts'] = {
+                state: {'duration_days': 30, 'next_path': '/'},
+            }
+        with self.oidc_config(MissingIdTokenClient()):
+            response = self.client.get(
+                f'/auth/pocket-id/callback?state={state}',
+                follow_redirects=False,
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers['Location'].endswith('/login?error=oidc_failed'))
+        with self.client.session_transaction() as login_session:
+            self.assertFalse(login_session.get('logged_in'))
+            self.assertNotIn(state, login_session.get('pocket_id_login_contexts', {}))
 
     def test_login_options_and_default_record_absolute_expiration(self):
         now = 1_700_000_000
         expected_lifetime = 24 * 60 * 60
 
-        self.assertEqual(
-            self.app.config['PERMANENT_SESSION_LIFETIME'],
-            180 * expected_lifetime,
-        )
         for duration in web_outlook_app.LOGIN_SESSION_DURATION_OPTIONS:
             client = self.app.test_client()
-            response = self._login(client, now, str(duration))
-            self.assertEqual(response.status_code, 200)
-            with client.session_transaction() as session:
+            response = self._login(client, now, duration)
+            self.assertEqual(response.status_code, 302)
+            with client.session_transaction() as login_session:
                 self.assertEqual(
-                    session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
+                    login_session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
                     now + duration * expected_lifetime,
                 )
+                self.assertEqual(login_session['pocket_id_subject'], 'pocket-user-123')
 
         default_client = self.app.test_client()
-        response = self._login(default_client, now)
-        self.assertEqual(response.status_code, 200)
-        with default_client.session_transaction() as session:
+        self._login(default_client, now)
+        with default_client.session_transaction() as login_session:
             self.assertEqual(
-                session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
+                login_session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
                 now + web_outlook_app.DEFAULT_LOGIN_SESSION_DURATION_DAYS * expected_lifetime,
             )
 
-    def test_permanent_login_does_not_expire(self):
+    def test_permanent_login_and_session_version_invalidation(self):
         now = 1_700_000_000
-        client = self.app.test_client()
         response = self._login(
-            client,
+            self.client,
             now,
             web_outlook_app.LOGIN_SESSION_PERMANENT_OPTION,
         )
-        self.assertEqual(response.status_code, 200)
-        with client.session_transaction() as session:
+        self.assertEqual(response.status_code, 302)
+        with self.client.session_transaction() as login_session:
             self.assertEqual(
-                session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
+                login_session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
                 web_outlook_app.LOGIN_SESSION_PERMANENT_OPTION,
             )
-            cookie_expiration = self.app.session_interface.get_expiration_time(
-                self.app,
-                session,
-            )
-        self.assertEqual(cookie_expiration.year, 9999)
+
+        with self.app.app_context():
+            web_outlook_app.rotate_login_session_version()
+        self.assertEqual(self.client.get('/api/settings').status_code, 401)
+
+    def test_expiration_protects_page_api_and_sse(self):
+        now = 1_700_000_000
+        duration = 7
+        client = self.app.test_client()
+        self._login(client, now, duration)
 
         with patch.object(
             web_outlook_app,
             'get_login_session_now',
-            return_value=now + 100 * 365 * 24 * 60 * 60,
+            return_value=now + duration * 24 * 60 * 60,
         ):
-            response = client.get('/api/settings')
-        self.assertEqual(response.status_code, 200)
+            page_response = client.get('/')
+            api_response = client.get('/api/settings')
+            sse_response = client.get('/api/accounts/refresh-all')
 
-        with self.app.app_context():
-            web_outlook_app.rotate_login_session_version()
-        response = client.get('/api/settings')
-        self.assertEqual(response.status_code, 401)
-
-    def test_invalid_duration_does_not_create_or_overwrite_session(self):
-        now = 1_700_000_000
-        response = self._login(self.client, now, 30)
-        self.assertEqual(response.status_code, 200)
-        with self.client.session_transaction() as session:
-            original_expiration = session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY]
-
-        for invalid_value in (60, None, True, 30.0, ''):
-            with patch.object(web_outlook_app, 'get_login_session_now', return_value=now):
-                response = self.client.post(
-                    '/login',
-                    json={
-                        'password': 'login-test-password',
-                        'session_duration_days': invalid_value,
-                    },
-                )
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.get_json()['error'], '登录有效期无效')
-            with self.client.session_transaction() as session:
-                self.assertTrue(session.get('logged_in'))
-                self.assertEqual(
-                    session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
-                    original_expiration,
-                )
-
-    def test_expiration_is_absolute_and_protects_page_api_and_sse(self):
-        now = 1_700_000_000
-        duration = 7
-        deadline = now + duration * 24 * 60 * 60
-
-        active_client = self.app.test_client()
-        self.assertEqual(self._login(active_client, now, duration).status_code, 200)
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=now + 1):
-            active_response = active_client.get('/api/settings')
-        self.assertEqual(active_response.status_code, 200)
-        with active_client.session_transaction() as session:
-            self.assertEqual(
-                session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
-                deadline,
-            )
-
-        page_client = self.app.test_client()
-        self.assertEqual(self._login(page_client, now, duration).status_code, 200)
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=deadline):
-            page_response = page_client.get('/')
         self.assertEqual(page_response.status_code, 302)
         self.assertTrue(page_response.headers['Location'].endswith('/login'))
-
-        api_client = self.app.test_client()
-        self.assertEqual(self._login(api_client, now, duration).status_code, 200)
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=deadline):
-            api_response = api_client.get('/api/settings')
-            sse_response = api_client.get('/api/accounts/refresh-all')
         self.assertEqual(api_response.status_code, 401)
         self.assertTrue(api_response.get_json()['need_login'])
         self.assertEqual(sse_response.status_code, 401)
-        with api_client.session_transaction() as session:
-            self.assertFalse(session.get('logged_in'))
-            self.assertIsNone(session.get(web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY))
 
-    def test_legacy_session_migrates_and_password_change_preserves_deadline(self):
-        now = 1_700_000_000
-        with self.client.session_transaction() as session:
-            session['logged_in'] = True
-            session['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
-
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=now):
-            response = self.client.get('/api/settings')
-        self.assertEqual(response.status_code, 200)
-        with self.client.session_transaction() as session:
-            migrated_expiration = session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY]
-        self.assertEqual(
-            migrated_expiration,
-            now + web_outlook_app.DEFAULT_LOGIN_SESSION_DURATION_DAYS * 24 * 60 * 60,
-        )
-
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=now):
-            response = self.client.put(
-                '/api/settings',
-                json={
-                    'login_password': 'new-login-password',
-                    'current_login_password': 'login-test-password',
-                },
-            )
-        self.assertEqual(response.status_code, 200)
-        with self.client.session_transaction() as session:
-            self.assertEqual(
-                session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
-                migrated_expiration,
-            )
-
-    def test_extension_login_uses_default_duration_and_ticket_remains_one_time(self):
-        now = 1_700_000_000
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=now):
-            response = self.client.post(
-                '/api/extension/login',
-                json={'password': 'login-test-password', 'next': '/#settings'},
-            )
+    def test_extension_login_returns_interactive_oidc_page_without_authenticating(self):
+        response = self.client.post('/api/extension/login', json={
+            'password': 'ignored',
+            'next': '/#settings',
+        })
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload['expires_in'], web_outlook_app.EXTENSION_LOGIN_TOKEN_TTL_SECONDS)
+        self.assertTrue(payload['success'])
+        self.assertTrue(payload['interactive'])
+        self.assertEqual(payload['launch_url'], '/login?next=/%23settings')
+        with self.client.session_transaction() as login_session:
+            self.assertFalse(login_session.get('logged_in'))
 
-        with patch.object(web_outlook_app, 'get_login_session_now', return_value=now):
-            launch_response = self.client.get(payload['launch_url'], follow_redirects=False)
-        self.assertEqual(launch_response.status_code, 302)
-        with self.client.session_transaction() as session:
-            self.assertEqual(
-                session[web_outlook_app.LOGIN_SESSION_EXPIRATION_KEY],
-                now + web_outlook_app.DEFAULT_LOGIN_SESSION_DURATION_DAYS * 24 * 60 * 60,
-            )
-
-        reused_response = self.client.get(payload['launch_url'], follow_redirects=False)
-        self.assertEqual(reused_response.status_code, 302)
-        self.assertTrue(reused_response.headers['Location'].endswith('/login'))
-
-    def test_login_template_exposes_duration_memory_without_password_storage(self):
+    def test_login_template_remembers_duration_without_password_storage(self):
         source = (ROOT_DIR / 'templates' / 'login.html').read_text(encoding='utf-8')
-
-        self.assertIn('<option value="7">7 天</option>', source)
-        self.assertIn('<option value="30" selected>30 天</option>', source)
-        self.assertIn('<option value="90">90 天</option>', source)
-        self.assertIn('<option value="180">180 天</option>', source)
-        self.assertIn('<option value="permanent">永久有效</option>', source)
         self.assertIn("const LOGIN_DURATION_STORAGE_KEY = 'outlook_login_duration_days';", source)
         self.assertIn('localStorage.getItem(LOGIN_DURATION_STORAGE_KEY)', source)
         self.assertIn('localStorage.setItem(LOGIN_DURATION_STORAGE_KEY, value)', source)
-        self.assertIn('session_duration_days: sessionDuration.value', source)
         self.assertNotRegex(source, r'localStorage\.setItem\([^)]*password')
 
 

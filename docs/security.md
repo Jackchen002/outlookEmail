@@ -1,41 +1,25 @@
 # 🔐 安全配置
 
-## 1. 修改默认密码
+## 1. Pocket ID 登录
 
-**方式一：首次部署时通过环境变量（仅初始化）**
+网站不接受本地密码登录，使用 Pocket ID OpenID Connect Authorization Code 流程。服务端通过 Discovery 获取授权、Token、UserInfo 和 JWKS 端点；Authlib 校验 OAuth `state`、OIDC `nonce`、ID Token 签名、Issuer 和 Audience。
 
-在 `docker-compose.yml` 中：
-```yaml
-environment:
-  - LOGIN_PASSWORD=your_secure_password_here
-  - SECRET_KEY=your-random-secret-key-here
-```
+必填环境变量与部署步骤见 [Pocket ID 登录与服务器部署](./pocket-id-deployment.md)。生产环境应同时满足：
 
-`LOGIN_PASSWORD` 只在数据库**尚无** `settings.login_password` 时用于写入初始哈希。实例已经启动并写过库之后，仅修改该环境变量**不会**改变当前登录密码。
+- `POCKET_ID_URL` 使用 HTTPS。
+- `POCKET_ID_REDIRECT_URI` 使用 HTTPS，且与 Pocket ID OIDC Client 的 Callback URL 完全一致。
+- `SESSION_COOKIE_SECURE=true`。
+- Client Secret 只保存在服务器 `.env` 或 Secret 管理器中，不提交到 Git，也不发送给浏览器。
 
-**方式二：通过 Web 界面修改（须知道当前密码）**
+### 敏感操作确认密码
 
-登录后点击「⚙️ 设置」按钮，在线修改登录密码。修改时必须填写当前密码；成功后当前会话保持登录，其他已登录设备/会话需要重新登录。
-
-**方式三：忘记密码时通过官方 CLI 重置（不需要旧密码）**
-
-具备主机或数据目录访问权限时，可运行：
-
-```bash
-python scripts/reset_login_password.py
-# Docker: docker exec -it <container> python scripts/reset_login_password.py
-```
-
-- 仅支持交互式终端输入新密码（无 `--password` / 管道传密）
-- 写入 bcrypt 哈希并轮换登录会话版本，使既有会话失效
-- 属于 **host 信任边界** 上的运维操作，与「已登录改密须验证当前密码」互补
-- 详细步骤见 [troubleshooting.md](./troubleshooting.md)「忘记 Web 登录密码」
+现有导出、账号密码显示、WebDAV 备份配置等敏感操作仍使用本地二次确认密码。`LOGIN_PASSWORD` 只在数据库尚无 `settings.login_password` 时写入初始 bcrypt 哈希，不再用于网站登录。可在系统设置中修改；忘记时使用 `scripts/reset_login_password.py`。
 
 ### 登录会话有效期
 
-Web 登录页提供固定的登录有效期选项：7 天、30 天、90 天、180 天和永久有效，默认 30 天。有限期限从登录成功时开始固定计算，后续访问页面或调用 API 不会续期；永久有效不会因登录时间自动失效。所有会话仍会在主动退出、登录密码修改导致会话版本轮换、SECRET_KEY 改变或浏览器清理 Cookie 后失效。
+Web 登录页提供 7 天、30 天、90 天、180 天和永久有效选项，默认 30 天。期限从 Pocket ID 回调验证成功时开始固定计算，后续访问不会续期。会话会在主动退出、敏感操作确认密码修改导致会话版本轮换、`SECRET_KEY` 改变或浏览器清理 Cookie 后失效。
 
-登录页只在当前浏览器本地记忆上次选择的期限，不保存密码、Session Cookie 或绝对过期时间。服务端仍会校验期限选项，直接调用登录接口不能绕过固定选项；浏览器扩展登录没有期限选择，默认建立 30 天会话。
+登录页只在当前浏览器本地记忆期限选项，不保存密码、Pocket ID Token、Session Cookie 或绝对过期时间。服务端仍会校验期限选项。
 
 ## 2. 启用 CSRF 防护（推荐）
 
@@ -66,7 +50,7 @@ pip install flask-wtf>=1.2.0
 
 **加密内容：**
 - Refresh Token（Fernet 对称加密）
-- 登录密码（bcrypt 哈希）
+- 敏感操作确认密码（bcrypt 哈希）
 - 邮箱密码（Fernet 对称加密）
 - 外部上传暂存表中的邮箱密码（Fernet 对称加密；列表接口和前端不返回、不展示明文）
 - 对外 API Key（Fernet 对称加密）
@@ -88,7 +72,7 @@ pip install flask-wtf>=1.2.0
 导出功能需要密码确认，防止未授权导出：
 
 **保护机制：**
-- 导出前需要输入登录密码
+- 导出前需要输入敏感操作确认密码
 - 一次性验证 Token，使用后立即失效
 - 所有导出操作记录审计日志
 - 记录操作时间、IP 地址和导出详情
@@ -100,10 +84,10 @@ SELECT * FROM audit_logs WHERE action = 'export' ORDER BY created_at DESC;
 
 ## 5.1 账号密码展示二次验证
 
-账号详情接口默认不返回账号密码和 IMAP 密码明文，只返回是否已保存密码的标记。Web 界面点击「验证显示」时，需要再次输入当前登录密码；验证通过后才会获取并显示账号密码。
+账号详情接口默认不返回账号密码和 IMAP 密码明文，只返回是否已保存密码的标记。Web 界面点击「验证显示」时，需要再次输入当前敏感操作确认密码；验证通过后才会获取并显示账号密码。
 
 **保护机制：**
-- 查看账号密码前需要输入登录密码
+- 查看账号密码前需要输入敏感操作确认密码
 - 未验证时保存账号不会清空已保存密码
 - 成功查看账号密码会记录审计日志
 - 审计日志只记录账号和操作信息，不记录密码内容
@@ -163,7 +147,7 @@ location / {
 
 ## 9. 使用强密码
 
-- 登录密码至少 8 位，包含大小写字母、数字和特殊字符
+- 敏感操作确认密码至少 8 位，包含大小写字母、数字和特殊字符
 - **SECRET_KEY 应使用随机生成的长字符串（至少 32 字节）**
 - 生成方法：`python -c 'import secrets; print(secrets.token_hex(32))'`
 - 定期更换密码

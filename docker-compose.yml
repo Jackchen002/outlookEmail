@@ -1,16 +1,16 @@
 version: '3.8'
 services:
   outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
+    image: ${OUTLOOK_EMAIL_IMAGE:-ghcr.io/jackchen002/outlookemail:latest}
     container_name: outlook-mail-reader
     ports:
       - "5000:5000"
     volumes:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
     environment:
-      - LOGIN_PASSWORD=admin123
-      - SECRET_KEY=your-secret-key-here
       - FLASK_ENV=production
       - DOCKER_UPDATE_ENABLED=true
       - DOCKER_UPDATE_CONTAINER=outlook-mail-reader

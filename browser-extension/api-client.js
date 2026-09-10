@@ -133,12 +133,8 @@
 
   async function loginForLaunch(config, nextPath = '/') {
     const serverUrl = trimUrl(config.serverUrl);
-    const password = String(config.password || '');
     if (!serverUrl) {
       throw new Error('请先填写服务地址');
-    }
-    if (!password) {
-      throw new Error('请先填写登录密码');
     }
 
     const granted = await ensureHostPermission(serverUrl);
@@ -149,130 +145,32 @@
     const payload = await fetchJson(`${serverUrl}/api/extension/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        password,
-        next: nextPath || '/',
-      }),
+      body: JSON.stringify({ next: nextPath || '/' }),
     });
 
     if (!payload || payload.success === false || !payload.launch_url) {
-      throw new Error((payload && (payload.error || payload.message)) || '登录失败');
+      throw new Error((payload && (payload.error || payload.message)) || '无法获取 Pocket ID 登录入口');
     }
 
     return {
       launchUrl: new URL(payload.launch_url, serverUrl).href,
-      expiresIn: payload.expires_in || 60,
+      interactive: payload.interactive === true,
     };
   }
 
-  async function loginWithPasswordSession(config) {
-    const serverUrl = trimUrl(config.serverUrl);
-    const password = String(config.password || '');
-    if (!serverUrl || !password) {
-      throw new Error('请先填写服务地址和登录密码');
-    }
-
-    const granted = await ensureHostPermission(serverUrl);
-    if (!granted) {
-      throw new Error('需要允许访问服务地址后才能继续');
-    }
-
-    const payload = await fetchJson(`${serverUrl}/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
-    });
-
-    if (!payload || payload.success !== true) {
-      throw new Error((payload && (payload.error || payload.message)) || '登录失败');
-    }
-    return true;
-  }
-
   async function openConsole(config, nextPath = '/') {
-    try {
-      const result = await loginForLaunch(config, nextPath);
-      await chrome.tabs.create({ url: result.launchUrl });
-      return result;
-    } catch (error) {
-      if (!isMissingExtensionLogin(error)) {
-        throw error;
-      }
-      return openConsoleWithLoginPage(config, nextPath);
-    }
+    const result = await loginForLaunch(config, nextPath);
+    await chrome.tabs.create({ url: result.launchUrl });
+    return result;
   }
 
   async function getEmbeddedConsoleUrl(config, nextPath = '/') {
-    const serverUrl = trimUrl(config.serverUrl);
-    try {
-      const result = await loginForLaunch(config, nextPath);
-      return result.launchUrl;
-    } catch (error) {
-      if (!isMissingExtensionLogin(error)) {
-        throw error;
-      }
-      await loginWithPasswordSession(config);
-      return `${serverUrl}${nextPath || '/'}`;
-    }
+    const result = await loginForLaunch(config, nextPath);
+    return result.launchUrl;
   }
 
   async function openConsoleWithLoginPage(config, nextPath = '/') {
-    const serverUrl = trimUrl(config.serverUrl);
-    const password = String(config.password || '');
-    if (!serverUrl || !password) {
-      throw new Error('请先填写服务地址和登录密码');
-    }
-
-    const granted = await ensureHostPermission(serverUrl);
-    if (!granted) {
-      throw new Error('需要允许访问服务地址后才能继续');
-    }
-
-    const tab = await chrome.tabs.create({ url: `${serverUrl}/login`, active: true });
-    if (!tab || !tab.id) {
-      throw new Error('无法打开登录页');
-    }
-
-    await waitForTabComplete(tab.id);
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      args: [password, nextPath || '/'],
-      func: async (loginPassword, targetPath) => {
-        function showLoginError(message) {
-          const errorMessage = document.getElementById('errorMessage');
-          if (errorMessage) {
-            errorMessage.textContent = message;
-            errorMessage.classList.add('show');
-          }
-        }
-
-        try {
-          const response = await fetch('/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password: loginPassword }),
-          });
-          const data = await response.json();
-          if (!data || data.success !== true) {
-            const message = (data && (data.error || data.message)) || '登录失败';
-            showLoginError(message);
-            return { success: false, error: message };
-          }
-          window.location.href = targetPath || '/';
-          return { success: true };
-        } catch (err) {
-          const message = (err && err.message) || '登录失败';
-          showLoginError(message);
-          return { success: false, error: message };
-        }
-      },
-    });
-
-    const result = results && results[0] ? results[0].result : null;
-    if (!result || result.success !== true) {
-      throw new Error((result && result.error) || '登录失败');
-    }
-    return { fallback: 'login-page' };
+    return openConsole(config, nextPath);
   }
 
   async function getCsrfToken(config) {
@@ -300,22 +198,8 @@
       return true;
     } catch {
       cachedCsrfToken = '';
+      throw new Error('Pocket ID 登录已失效，请先打开网页登录并完成验证');
     }
-
-    try {
-      const launch = await loginForLaunch(config, '/');
-      await fetchRaw(launch.launchUrl, { method: 'GET' });
-      await getCsrfToken(config);
-      return true;
-    } catch (error) {
-      if (!isMissingExtensionLogin(error)) {
-        cachedCsrfToken = '';
-      }
-    }
-
-    await loginWithPasswordSession(config);
-    await getCsrfToken(config);
-    return true;
   }
 
   async function apiRequest(config, path, options = {}) {
@@ -457,7 +341,6 @@
     trimUrl,
     ensureHostPermission,
     loginForLaunch,
-    loginWithPasswordSession,
     openConsole,
     openConsoleWithLoginPage,
     getEmbeddedConsoleUrl,

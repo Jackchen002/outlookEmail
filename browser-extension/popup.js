@@ -29,11 +29,7 @@
   }
 
   function readFormConfig() {
-    return {
-      serverUrl: Api.trimUrl(getEl('serverUrl').value),
-      password: getEl('password').value,
-      rememberPassword: getEl('rememberPassword').checked,
-    };
+    return { serverUrl: Api.trimUrl(getEl('serverUrl').value) };
   }
 
   async function saveFormConfig(config) {
@@ -42,6 +38,10 @@
 
   async function openSidePanel(nextPath) {
     const config = readFormConfig();
+    if (!config.serverUrl) {
+      showMessage('请先填写服务地址', 'error');
+      return;
+    }
     await saveFormConfig(config);
     await Storage.setSidePanelPath(nextPath || '/');
     setBusy(true);
@@ -52,39 +52,24 @@
       }
       const currentWindow = await chrome.windows.getCurrent();
       await chrome.sidePanel.open({ windowId: currentWindow.id });
-      setConnected(true);
       showMessage('已打开侧边栏控制台');
     } catch (error) {
-      setConnected(false);
       showMessage(Api.friendlyError(error), 'error');
     } finally {
       setBusy(false);
     }
   }
 
-  async function testLogin() {
+  async function startPocketIdLogin() {
     const config = readFormConfig();
     await saveFormConfig(config);
     setBusy(true);
-    showMessage('正在验证密码...');
+    showMessage('正在打开 Pocket ID 登录页...');
     try {
-      await Api.loginForLaunch(config, '/');
-      setConnected(true);
-      showMessage('密码验证通过，可以打开控制台');
-    } catch (error) {
-      if (Api.isMissingExtensionLogin(error)) {
-        try {
-          await Api.loginWithPasswordSession(config);
-          setConnected(true);
-          showMessage('兼容模式密码验证通过，可以打开侧边栏控制台');
-          return;
-        } catch (fallbackError) {
-          setConnected(false);
-          showMessage(Api.friendlyError(fallbackError), 'error');
-          return;
-        }
-      }
+      await Api.openConsole(config, '/');
       setConnected(false);
+      showMessage('请在新标签页点击登录并完成 Pocket ID 验证');
+    } catch (error) {
       showMessage(Api.friendlyError(error), 'error');
     } finally {
       setBusy(false);
@@ -97,14 +82,13 @@
       showMessage('请先填写服务地址', 'error');
       return;
     }
-    await openSidePanel('/logout');
+    await chrome.tabs.create({ url: `${config.serverUrl}/logout` });
+    setConnected(false);
   }
 
   async function clearConfig() {
     await Storage.clearConfig();
     getEl('serverUrl').value = '';
-    getEl('password').value = '';
-    getEl('rememberPassword').checked = false;
     setConnected(false);
     showMessage('本地配置已清除');
   }
@@ -112,10 +96,8 @@
   document.addEventListener('DOMContentLoaded', async () => {
     const config = await Storage.getConfig();
     getEl('serverUrl').value = config.serverUrl || '';
-    getEl('password').value = config.password || '';
-    getEl('rememberPassword').checked = config.rememberPassword === true;
 
-    getEl('btnTest').addEventListener('click', testLogin);
+    getEl('btnTest').addEventListener('click', startPocketIdLogin);
     getEl('btnOpen').addEventListener('click', () => openSidePanel('/'));
     getEl('btnLogout').addEventListener('click', openLogout);
     getEl('btnClear').addEventListener('click', clearConfig);

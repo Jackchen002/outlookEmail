@@ -1,6 +1,6 @@
 # OutlookEmail 浏览器扩展使用说明
 
-这是 OutlookEmail 的 Chrome / Edge 浏览器扩展。扩展使用 Web 端登录密码建立正常 Web Session，不使用对外 API Key；所有管理请求仍走服务端现有的 Session + CSRF 保护。
+这是 OutlookEmail 的 Chrome / Edge 浏览器扩展。扩展复用浏览器中由 Pocket ID 建立的 Web Session，不使用对外 API Key；所有管理请求仍走服务端现有的 Session + CSRF 保护。
 
 扩展默认在浏览器侧边栏中运行，不会切换当前网页标签页。
 
@@ -34,17 +34,14 @@
 ## 首次配置
 
 1. 点击浏览器工具栏里的 OutlookEmail 扩展图标，打开侧边栏。
-2. 填写“服务地址”，例如：
-   - 本地运行：`http://127.0.0.1:5000`
-   - 服务器部署：`https://your-domain.example`
-3. 填写“Web 登录密码”，也就是登录 OutlookEmail Web 页面使用的密码。
-4. 按需勾选“记住密码到本机浏览器”。
-5. 点击“保存配置”，或直接点击上方功能入口开始使用。
+2. 填写“服务地址”，例如 `https://your-domain.example`。
+3. 点击“打开 Pocket ID 登录”，在新标签页完成 Pocket ID 验证。
+4. 回到侧边栏并点击“刷新”。
 
 说明：
 
-- 如果勾选“记住密码到本机浏览器”，密码会保存在当前浏览器本地扩展存储中。
-- 如果不勾选，密码只放在浏览器会话级存储中；浏览器会话结束后需要重新输入。
+- 扩展不会保存 Pocket ID Client Secret、用户密码或 Session Cookie。
+- Pocket ID Client Secret 只应配置在服务器 `.env` 中。
 - 扩展第一次访问服务地址时，浏览器可能弹出站点访问权限确认，需要允许。
 
 ## 日常使用
@@ -197,13 +194,13 @@ Token 页用于辅助获取 Microsoft OAuth Refresh Token，并可直接保存�
 
 扩展登录流程如下：
 
-1. 扩展调用 `POST /api/extension/login`。
-2. 服务端验证 Web 登录密码。
-3. 服务端返回 60 秒有效的一次性 `launch_url`。
-4. 扩展访问 `launch_url`，服务端在自身域名下写入正常 Web Session。
-5. 后续扩展请求使用该 Session，并通过 `GET /api/csrf-token` 获取 CSRF Token。
+1. 扩展调用 `POST /api/extension/login` 获取交互式登录页地址。
+2. 扩展在新标签页打开 OutlookEmail 默认登录页。
+3. 用户点击“登录”并在 Pocket ID 完成验证。
+4. Pocket ID 回调由服务端校验，随后在 OutlookEmail 域名下建立 Web Session。
+5. 后续扩展请求复用该 Session，并通过 `GET /api/csrf-token` 获取 CSRF Token。
 
-如果服务端版本太旧，没有 `/api/extension/login`，扩展会尝试回退到 `/login` 密码登录接口。
+扩展不再兼容旧版 `/login` 密码登录接口；服务端与扩展应同时升级。
 
 ## 常见问题
 
@@ -212,7 +209,7 @@ Token 页用于辅助获取 Microsoft OAuth Refresh Token，并可直接保存�
 检查：
 
 - 服务地址是否正确，不能多写路径，例如应填写 `https://your-domain.example`，不要填写 `https://your-domain.example/#settings`。
-- Web 登录密码是否正确。
+- Pocket ID 登录是否已在普通网页标签中完成。
 - 浏览器是否允许扩展访问该服务地址。
 - 服务端是否可以正常打开。
 - 部署反向代理是否正确转发 Cookie。
@@ -239,9 +236,9 @@ Token 页用于辅助获取 Microsoft OAuth Refresh Token，并可直接保存�
 
 需要在浏览器扩展管理页点击“重新加载”。只刷新网页不会更新已加载的扩展代码。
 
-### 不想保存密码
+### Pocket ID 登录完成后侧边栏仍提示未登录
 
-取消勾选“记住密码到本机浏览器”。这样密码只保存在浏览器会话级存储中，关闭浏览器会话后需要重新输入。
+先确认普通网页标签已经回到 OutlookEmail 首页，再回到侧边栏点击“刷新”。如果浏览器阻止第三方 Cookie，请允许扩展访问 OutlookEmail 站点后重试。
 
 ## 文件说明
 

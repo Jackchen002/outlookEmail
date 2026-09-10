@@ -38,13 +38,17 @@ from urllib.parse import quote, urlparse, unquote
 from zoneinfo import ZoneInfo
 from flask import Flask, render_template, request, jsonify, g, session, redirect, url_for, Response, make_response, has_app_context
 from flask.sessions import SecureCookieSessionInterface
+from authlib.integrations.flask_client import OAuth
 from functools import wraps
 import requests
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from dotenv import load_dotenv
 from outlook_web.runtime import default_database_path, resource_path, resolve_secret_key, runtime_root
 from outlook_web.mail_datetime import parse_mail_datetime
+
+load_dotenv()
 
 # 尝试导入 Flask-WTF CSRF 保护
 try:
@@ -78,6 +82,34 @@ app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 24 * 180  # 180 天
 # Session Cookie 配置（适用于 HTTPS 代理环境）
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = str(
+    os.getenv('SESSION_COOKIE_SECURE', 'false')
+).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+# Pocket ID OpenID Connect 配置。回调地址显式配置，避免根据不可信 Host 头拼接。
+POCKET_ID_URL = str(os.getenv('POCKET_ID_URL', '') or '').strip().rstrip('/')
+POCKET_ID_CLIENT_ID = str(os.getenv('POCKET_ID_CLIENT_ID', '') or '').strip()
+POCKET_ID_CLIENT_SECRET = str(os.getenv('POCKET_ID_CLIENT_SECRET', '') or '').strip()
+POCKET_ID_REDIRECT_URI = str(os.getenv('POCKET_ID_REDIRECT_URI', '') or '').strip()
+POCKET_ID_SCOPES = str(
+    os.getenv('POCKET_ID_SCOPES', 'openid profile email') or 'openid profile email'
+).strip()
+
+OIDC_OAUTH = OAuth(app)
+pocket_id_oidc_client = None
+if all((
+    POCKET_ID_URL,
+    POCKET_ID_CLIENT_ID,
+    POCKET_ID_CLIENT_SECRET,
+    POCKET_ID_REDIRECT_URI,
+)):
+    pocket_id_oidc_client = OIDC_OAUTH.register(
+        name='pocket_id',
+        client_id=POCKET_ID_CLIENT_ID,
+        client_secret=POCKET_ID_CLIENT_SECRET,
+        server_metadata_url=f'{POCKET_ID_URL}/.well-known/openid-configuration',
+        client_kwargs={'scope': POCKET_ID_SCOPES},
+    )
 
 
 def resolve_log_level(raw: Optional[str] = None) -> int:
@@ -3433,10 +3465,22 @@ def establish_web_login_session(duration_days: Optional[Union[int, str]] = None)
 
 
 def clear_web_login_session() -> None:
-    """清除 Web 登录状态。"""
-    session.pop('logged_in', None)
-    session.pop('login_session_version', None)
-    session.pop(LOGIN_SESSION_EXPIRATION_KEY, None)
+    """清除 Web 与 Pocket ID 登录状态。"""
+    keys_to_remove = {
+        'logged_in',
+        'login_session_version',
+        LOGIN_SESSION_EXPIRATION_KEY,
+        'pocket_id_subject',
+        'pocket_id_email',
+        'pocket_id_name',
+        'pocket_id_login_contexts',
+    }
+    keys_to_remove.update(
+        key for key in session.keys()
+        if str(key).startswith('_state_pocket_id_')
+    )
+    for key in keys_to_remove:
+        session.pop(key, None)
     session.modified = True
 
 
