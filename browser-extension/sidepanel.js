@@ -215,11 +215,7 @@
   }
 
   function readConfig() {
-    return {
-      serverUrl: Api.trimUrl(getEl('serverUrl').value),
-      password: getEl('password').value,
-      rememberPassword: getEl('rememberPassword').checked,
-    };
+    return { serverUrl: Api.trimUrl(getEl('serverUrl').value) };
   }
 
   async function saveConfig() {
@@ -2132,13 +2128,16 @@
   document.addEventListener('DOMContentLoaded', async () => {
     const config = await Storage.getConfig();
     getEl('serverUrl').value = config.serverUrl || '';
-    getEl('password').value = config.password || '';
-    getEl('rememberPassword').checked = config.rememberPassword === true;
 
     getEl('btnConfig').addEventListener('click', toggleConfigPanel);
     getEl('btnLogin').addEventListener('click', async () => {
-      await saveConfig();
-      await renderView(currentView);
+      const savedConfig = await saveConfig();
+      try {
+        await Api.openConsole(savedConfig, '/');
+        showMessage('请在新标签页完成 Pocket ID 登录，随后点击刷新');
+      } catch (error) {
+        showMessage(Api.friendlyError(error), 'error');
+      }
     });
     getEl('btnReload').addEventListener('click', () => renderView(currentView));
 
@@ -2147,11 +2146,11 @@
     });
 
     setActiveView(currentView);
-    if (config.serverUrl && config.password) {
+    if (config.serverUrl) {
       getEl('configPanel').classList.add('collapsed');
       await renderView(currentView);
     } else {
-      setContent('<div class="card muted">填写服务地址和 Web 登录密码后，直接点击上方功能即可在侧边栏内操作。</div>');
+      setContent('<div class="card muted">填写服务地址并通过 Pocket ID 登录后，即可在侧边栏内操作。</div>');
     }
   });
 })();

@@ -9,143 +9,169 @@ if TYPE_CHECKING:
     from web_outlook_app import *  # noqa: F403
 
 
-@app.route('/login', methods=['GET', 'POST'])
-@csrf_exempt  # 登录接口排除CSRF保护（用户未登录时无法获取token）
+def normalize_login_next_path(next_path: str) -> str:
+    value = str(next_path or '').strip()
+    if not value or not value.startswith('/') or value.startswith('//'):
+        return '/'
+    if '\\' in value or any(ord(character) < 32 for character in value):
+        return '/'
+    return value
+
+
+def get_pocket_id_configuration_error() -> str:
+    missing = [
+        name
+        for name, value in (
+            ('POCKET_ID_URL', POCKET_ID_URL),
+            ('POCKET_ID_CLIENT_ID', POCKET_ID_CLIENT_ID),
+            ('POCKET_ID_CLIENT_SECRET', POCKET_ID_CLIENT_SECRET),
+            ('POCKET_ID_REDIRECT_URI', POCKET_ID_REDIRECT_URI),
+        )
+        if not value
+    ]
+    if missing:
+        return f"Pocket ID 配置不完整：{', '.join(missing)}"
+
+    issuer = urlparse(POCKET_ID_URL)
+    redirect_uri = urlparse(POCKET_ID_REDIRECT_URI)
+    if issuer.scheme != 'https' or not issuer.netloc or issuer.query or issuer.fragment:
+        return 'POCKET_ID_URL 必须是有效的 HTTPS 地址且不能包含查询参数或片段'
+    if redirect_uri.scheme not in ('http', 'https') or not redirect_uri.netloc:
+        return 'POCKET_ID_REDIRECT_URI 必须是有效的 HTTP(S) 地址'
+    if redirect_uri.query or redirect_uri.fragment:
+        return 'POCKET_ID_REDIRECT_URI 不能包含查询参数或片段'
+    if redirect_uri.path != '/auth/pocket-id/callback':
+        return 'POCKET_ID_REDIRECT_URI 路径必须是 /auth/pocket-id/callback'
+    if redirect_uri.scheme != 'https' and redirect_uri.hostname not in ('localhost', '127.0.0.1', '::1'):
+        return '生产环境的 POCKET_ID_REDIRECT_URI 必须使用 HTTPS'
+    if 'openid' not in POCKET_ID_SCOPES.split():
+        return 'POCKET_ID_SCOPES 必须包含 openid'
+    if pocket_id_oidc_client is None:
+        return 'Pocket ID OIDC 客户端尚未初始化，请重启应用'
+    return ''
+
+
+def discard_pocket_id_login_context(state: str) -> None:
+    normalized_state = str(state or '')
+    login_contexts = dict(session.get('pocket_id_login_contexts') or {})
+    if normalized_state:
+        login_contexts.pop(normalized_state, None)
+        session.pop(f'_state_pocket_id_{normalized_state}', None)
+    session['pocket_id_login_contexts'] = login_contexts
+    session.modified = True
+
+
+@app.route('/login', methods=['GET'])
 def login():
-    """登录页面"""
-    if request.method == 'POST':
-        try:
-            # 获取客户端 IP
-            client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-            if client_ip:
-                client_ip = client_ip.split(',')[0].strip()
+    """显示 Pocket ID 登录入口。"""
+    next_path = normalize_login_next_path(request.args.get('next') or '/')
+    if is_web_login_session_valid():
+        return redirect(next_path)
 
-            # 检查速率限制
-            allowed, remaining_time = check_rate_limit(client_ip)
-            if not allowed:
-                return jsonify({
-                    'success': False,
-                    'error': f'登录失败次数过多，请在 {remaining_time} 秒后重试'
-                }), 429
+    error_messages = {
+        'configuration': 'Pocket ID 配置不完整，请联系管理员检查服务器配置。',
+        'invalid_duration': '登录有效期无效，请重新选择。',
+        'oidc_failed': 'Pocket ID 登录失败，请重试。',
+    }
+    return render_template(
+        'login.html',
+        login_error=error_messages.get(str(request.args.get('error') or '')),
+        next_path=next_path,
+    )
 
-            data = request.get_json(silent=True) if request.is_json else request.form
-            data = data or {}
-            password = data.get('password', '')
-            duration_provided = 'session_duration_days' in data
-            duration_days = normalize_login_session_duration(
-                data.get('session_duration_days'),
-                allow_default=not duration_provided,
-            )
 
-            # 从数据库获取密码哈希
-            stored_password = get_login_password()
+@app.route('/auth/pocket-id', methods=['GET'])
+def pocket_id_login():
+    """启动 Pocket ID OIDC Authorization Code 登录。"""
+    configuration_error = get_pocket_id_configuration_error()
+    if configuration_error:
+        app.logger.error(configuration_error)
+        return redirect(url_for('login', error='configuration'))
 
-            # 验证密码
-            if verify_password(password, stored_password):
-                if duration_days is None:
-                    return jsonify({'success': False, 'error': '登录有效期无效'}), 400
-                # 登录成功，重置失败记录
-                reset_login_attempts(client_ip)
-                establish_web_login_session(duration_days)
-                return jsonify({'success': True, 'message': '登录成功'})
-            else:
-                # 登录失败，记录失败次数
-                record_login_failure(client_ip)
-                return jsonify({'success': False, 'error': '密码错误'})
-        except Exception as e:
-            print(f"Login error: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'success': False, 'error': f'登录处理失败: {str(e)}'}), 500
+    raw_duration = request.args.get('session_duration_days')
+    duration_days = normalize_login_session_duration(
+        raw_duration,
+        allow_default=raw_duration is None,
+    )
+    if duration_days is None:
+        return redirect(url_for('login', error='invalid_duration'))
 
-    # GET 请求返回登录页面
-    return render_template('login.html')
+    state = secrets.token_urlsafe(32)
+    login_contexts = dict(session.get('pocket_id_login_contexts') or {})
+    login_contexts[state] = {
+        'duration_days': duration_days,
+        'next_path': normalize_login_next_path(request.args.get('next') or '/'),
+    }
+    # 只保留最近的少量并发登录，避免废弃流程无限增大签名 Cookie。
+    while len(login_contexts) > 5:
+        login_contexts.pop(next(iter(login_contexts)))
+    session['pocket_id_login_contexts'] = login_contexts
+    session.modified = True
+    return pocket_id_oidc_client.authorize_redirect(
+        POCKET_ID_REDIRECT_URI,
+        state=state,
+    )
+
+
+@app.route('/auth/pocket-id/callback', methods=['GET'])
+def pocket_id_callback():
+    """校验 Pocket ID 回调并建立本地 Web Session。"""
+    configuration_error = get_pocket_id_configuration_error()
+    if configuration_error:
+        app.logger.error(configuration_error)
+        return redirect(url_for('login', error='configuration'))
+
+    returned_state = str(request.args.get('state') or '')
+    try:
+        token = pocket_id_oidc_client.authorize_access_token()
+        if not token.get('id_token'):
+            raise ValueError('Pocket ID Token 响应缺少 ID Token')
+
+        userinfo = token.get('userinfo') or {}
+        subject = str(userinfo.get('sub') or '').strip()
+        if not subject:
+            raise ValueError('Pocket ID ID Token 缺少 sub')
+
+        login_contexts = dict(session.get('pocket_id_login_contexts') or {})
+        login_context = login_contexts.pop(returned_state, None)
+        if not isinstance(login_context, dict):
+            raise ValueError('Pocket ID 登录上下文不存在或已过期')
+        session['pocket_id_login_contexts'] = login_contexts
+
+        duration_days = login_context.get('duration_days')
+        next_path = normalize_login_next_path(login_context.get('next_path') or '/')
+        establish_web_login_session(duration_days)
+        session['pocket_id_subject'] = subject
+        session['pocket_id_email'] = str(userinfo.get('email') or '').strip()
+        session['pocket_id_name'] = str(
+            userinfo.get('preferred_username') or userinfo.get('name') or ''
+        ).strip()
+        session.modified = True
+        return redirect(next_path)
+    except Exception:
+        app.logger.exception('Pocket ID OIDC callback failed')
+        discard_pocket_id_login_context(returned_state)
+        return redirect(url_for('login', error='oidc_failed'))
 
 
 @app.route('/logout')
 def logout():
-    """退出登录"""
+    """退出本地登录会话。"""
     clear_web_login_session()
     return redirect(url_for('login'))
-
-
-extension_login_tokens = {}
-EXTENSION_LOGIN_TOKEN_TTL_SECONDS = 60
-
-
-def prune_extension_login_tokens():
-    now = time.time()
-    expired_tokens = [
-        token for token, payload in extension_login_tokens.items()
-        if float(payload.get('expires_at', 0)) <= now
-    ]
-    for token in expired_tokens:
-        extension_login_tokens.pop(token, None)
-
-
-def normalize_extension_next_path(next_path: str) -> str:
-    value = str(next_path or '').strip()
-    if not value or not value.startswith('/') or value.startswith('//'):
-        return '/'
-    if '\r' in value or '\n' in value:
-        return '/'
-    return value
 
 
 @app.route('/api/extension/login', methods=['POST'])
 @csrf_exempt
 def api_extension_login():
-    """浏览器扩展密码登录：返回一次性 Web 会话跳转地址。"""
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if client_ip:
-        client_ip = client_ip.split(',')[0].strip()
-
-    allowed, remaining_time = check_rate_limit(client_ip)
-    if not allowed:
-        return jsonify({
-            'success': False,
-            'error': f'登录失败次数过多，请在 {remaining_time} 秒后重试'
-        }), 429
-
+    """为浏览器扩展返回交互式 Pocket ID 登录入口。"""
     data = request.get_json(silent=True) or {}
-    password = str(data.get('password') or '')
-    if not verify_login_password(password):
-        record_login_failure(client_ip)
-        return jsonify({'success': False, 'error': '密码错误'}), 401
-
-    reset_login_attempts(client_ip)
-    prune_extension_login_tokens()
-
-    token = secrets.token_urlsafe(32)
-    next_path = normalize_extension_next_path(data.get('next') or '/')
-    extension_login_tokens[token] = {
-        'expires_at': time.time() + EXTENSION_LOGIN_TOKEN_TTL_SECONDS,
-        'next': next_path,
-        'login_session_version': get_login_session_version(),
-    }
-
+    next_path = normalize_login_next_path(data.get('next') or '/')
     return jsonify({
         'success': True,
-        'launch_url': url_for('extension_login', token=token, next=next_path),
-        'expires_in': EXTENSION_LOGIN_TOKEN_TTL_SECONDS,
+        'launch_url': url_for('login', next=next_path),
+        'interactive': True,
     })
-
-
-@app.route('/extension-login/<token>', methods=['GET'])
-@csrf_exempt
-def extension_login(token):
-    """消费扩展一次性登录票据，在服务端域名下建立 Web Session。"""
-    prune_extension_login_tokens()
-    payload = extension_login_tokens.pop(str(token or ''), None)
-    if not payload:
-        return redirect(url_for('login'))
-
-    token_version = str(payload.get('login_session_version') or DEFAULT_LOGIN_SESSION_VERSION)
-    if token_version != get_login_session_version():
-        return redirect(url_for('login'))
-
-    establish_web_login_session()
-    return redirect(normalize_extension_next_path(request.args.get('next') or payload.get('next') or '/'))
 
 
 @app.route('/favicon.ico')

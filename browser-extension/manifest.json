@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OutlookEmail 控制台",
   "version": "0.1.0",
-  "description": "使用 Web 登录密码打开 OutlookEmail 控制台，并复用完整 Web 端功能。",
+  "description": "通过 Pocket ID 登录 OutlookEmail 控制台，并复用完整 Web 端功能。",
   "action": {
     "default_title": "OutlookEmail"
   },

@@ -1,5 +1,7 @@
 # 🚀 部署指南
 
+网站登录已改为 Pocket ID OIDC。部署前请先完成 [Pocket ID 登录与服务器部署](./pocket-id-deployment.md) 中的 OIDC Client 和 `.env` 配置。
+
 ## 方式一：使用 Windows `exe`
 
 从 GitHub Releases 下载对应版本的 `OutlookEmail-windows-x64-*.zip`，解压后直接运行 `OutlookEmail.exe`。
@@ -27,9 +29,8 @@ docker run -d \
   --name outlook-mail-reader \
   -p 5000:5000 \
   -v $(pwd)/data:/app/data \
-  -e LOGIN_PASSWORD=admin123 \
-  -e SECRET_KEY=your-secret-key-here \
-  ghcr.io/assast/outlookemail:latest
+  --env-file .env \
+  ghcr.io/jackchen002/outlookemail:latest
 
 # 查看日志
 docker logs -f outlook-mail-reader
@@ -55,12 +56,11 @@ cd outlookEmail
 # 安装依赖
 pip install -r requirements.txt
 
-# 设置环境变量
-export LOGIN_PASSWORD=admin123
-export SECRET_KEY=your-secret-key-here
-export PORT=5000
+# 创建并填写环境变量文件
+cp .env.example .env
+# 修改 SECRET_KEY、POCKET_ID_CLIENT_ID、POCKET_ID_CLIENT_SECRET 和 POCKET_ID_REDIRECT_URI
 
-# 运行应用
+# 运行应用（启动时会自动读取 .env）
 python web_outlook_app.py
 ```
 
@@ -92,9 +92,9 @@ services:
       - "5000:5000"
     volumes:
       - ./data:/app/data
+    env_file:
+      - .env
     environment:
-      - LOGIN_PASSWORD=admin123
-      - SECRET_KEY=your-secret-key-here
       - FLASK_ENV=production
       - GPTMAIL_API_KEY=your-api-key
     restart: unless-stopped
@@ -122,7 +122,13 @@ docker-compose down
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
 | `SECRET_KEY` | Session 密钥（服务器部署强烈建议固定设置） | Windows `exe` 首次启动会自动生成并持久化；Docker / Python / 生产环境请显式设置固定值，不要随意修改，否则会导致已存储敏感数据无法解密 |
-| `LOGIN_PASSWORD` | 登录密码 | `admin123` |
+| `LOGIN_PASSWORD` | 现有敏感操作的本地二次确认密码，不用于网站登录 | 无安全默认值，必须修改模板占位值 |
+| `POCKET_ID_URL` | Pocket ID Issuer 地址 | `https://sso.jackyccc.com` |
+| `POCKET_ID_CLIENT_ID` | Pocket ID OIDC Client ID | 必填 |
+| `POCKET_ID_CLIENT_SECRET` | Pocket ID OIDC Client Secret | 必填 |
+| `POCKET_ID_REDIRECT_URI` | Pocket ID 回调 URL，必须与客户端登记值完全一致 | 必填 |
+| `POCKET_ID_SCOPES` | OIDC Scopes，必须包含 `openid` | `openid profile email` |
+| `SESSION_COOKIE_SECURE` | 仅通过 HTTPS 发送 Session Cookie | 生产 `.env` 应设为 `true` |
 | `FLASK_ENV` | 运行环境 | `production` |
 | `LOG_LEVEL` | 全局日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`）。默认 `INFO` 会输出出站 `[代理]` 详情（含 Resin Platform/Account，密码已打码）。批量拉信或 Token 刷新时日志较多，生产环境若只需告警可设 `LOG_LEVEL=WARNING` 降噪 | `INFO` |
 | `PORT` | 应用端口 | `5000` |
@@ -199,7 +205,7 @@ docker run -d \
   --name outlook-mail-reader \
   -p 5000:5000 \
   -v $(pwd)/data:/app/data \
-  -e LOGIN_PASSWORD=admin123 \
+  --env-file .env \
   outlook-mail-reader
 ```
 

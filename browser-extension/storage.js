@@ -1,39 +1,33 @@
 (function () {
-  const CONFIG_KEY = 'outlookEmailPasswordConfig';
+  const CONFIG_KEY = 'outlookEmailOidcConfig';
+  const LEGACY_CONFIG_KEY = 'outlookEmailPasswordConfig';
   const SESSION_PASSWORD_KEY = 'outlookEmailSessionPassword';
   const SIDE_PANEL_PATH_KEY = 'outlookEmailSidePanelPath';
   const SELECTED_MAIL_GROUP_KEY = 'outlookEmailSelectedMailGroupId';
 
   const ExtensionStorage = {
     async getConfig() {
-      const data = await chrome.storage.local.get(CONFIG_KEY);
-      const config = data[CONFIG_KEY] || {};
-      if (!config.password && chrome.storage.session) {
-        const sessionData = await chrome.storage.session.get(SESSION_PASSWORD_KEY);
-        config.password = sessionData[SESSION_PASSWORD_KEY] || '';
-      }
-      return config;
+      const data = await chrome.storage.local.get([CONFIG_KEY, LEGACY_CONFIG_KEY]);
+      const config = data[CONFIG_KEY] || data[LEGACY_CONFIG_KEY] || {};
+      return { serverUrl: config.serverUrl || '' };
     },
 
     async setConfig(config) {
       await chrome.storage.local.set({
-        [CONFIG_KEY]: {
-          serverUrl: config.serverUrl || '',
-          password: config.rememberPassword ? (config.password || '') : '',
-          rememberPassword: config.rememberPassword === true,
-        },
+        [CONFIG_KEY]: { serverUrl: config.serverUrl || '' },
       });
+      await chrome.storage.local.remove(LEGACY_CONFIG_KEY);
       if (chrome.storage.session) {
-        if (config.password) {
-          await chrome.storage.session.set({ [SESSION_PASSWORD_KEY]: config.password });
-        } else {
-          await chrome.storage.session.remove(SESSION_PASSWORD_KEY);
-        }
+        await chrome.storage.session.remove(SESSION_PASSWORD_KEY);
       }
     },
 
     async clearConfig() {
-      await chrome.storage.local.remove([CONFIG_KEY, SELECTED_MAIL_GROUP_KEY]);
+      await chrome.storage.local.remove([
+        CONFIG_KEY,
+        LEGACY_CONFIG_KEY,
+        SELECTED_MAIL_GROUP_KEY,
+      ]);
       if (chrome.storage.session) {
         await chrome.storage.session.remove(SESSION_PASSWORD_KEY);
       }

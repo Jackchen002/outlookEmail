@@ -2,12 +2,7 @@
 
 一个面向多邮箱账号场景的邮件管理工具，支持通过 Outlook/Hotmail OAuth、Microsoft Graph API 和标准 IMAP 统一读取、管理和转发邮件，并提供 Web 界面、Chrome/Edge 浏览器扩展，用于分组管理、账号管理、邮件查看和对外 API 调用。当前支持 Outlook/Hotmail、Gmail、QQ、163、126、Yahoo、阿里邮箱以及自定义 IMAP 邮箱，同时集成 GPTMail、DuckMail、Cloudflare Temp Email 多提供商临时邮箱能力。
 
-注意：改密码会导致auth失效，需要重新授权
-## 📦 快速开始
-### 体验站点（可能非最新版本）
-https://aso.de5.net
-admin123
-注意：体验站点请勿修改密码或存放实际数据，部署在无持久化的服务上，数据随时可能丢失恢复初始状态；并且由于大家都能登录看到，并且好像有进程在扫描，所以非常可能存在账号被盗的风险
+Pocket ID 登录与服务器部署请见 [`docs/pocket-id-deployment.md`](docs/pocket-id-deployment.md)。
 
 ## 🌿 版本管理与发布
 
@@ -28,7 +23,7 @@ admin123
 说明：
 
 - Windows 数据默认保存在 `%APPDATA%\OutlookEmail`
-- 默认登录密码仍然是 `admin123`，首次登录后建议立即修改
+- 运行前需要配置 Pocket ID OIDC 参数；服务器部署步骤见 [Pocket ID 登录与服务器部署](docs/pocket-id-deployment.md)
 
 ### 方式二：下载 macOS 安装包
 
@@ -45,38 +40,31 @@ admin123
 - macOS 数据默认保存在 `~/Library/Application Support/OutlookEmail`
 - 如果 macOS 提示Apple无法验证“OutlookEmail”是否包含可能危害Mac安全或泄漏隐私的恶意软件。可执行下面命令然后重试
   `sudo xattr -rd com.apple.quarantine /Applications/OutlookEmail.app` 
-- 默认登录密码仍然是 `admin123`，首次登录后建议立即修改
+- 运行前需要配置 Pocket ID OIDC 参数；服务器部署步骤见 [Pocket ID 登录与服务器部署](docs/pocket-id-deployment.md)
 
 ### 方式三：使用 Docker（推荐服务器部署）
 
-```bash
-# 拉取最新镜像
-docker pull ghcr.io/assast/outlookemail:latest
+先在 Pocket ID 中创建 OIDC Client，再从模板创建 `.env`。完整步骤见 [Pocket ID 登录与服务器部署](docs/pocket-id-deployment.md)。
 
-# 运行容器
-docker run -d \
-  --name outlook-mail-reader \
-  -p 5000:5000 \
-  -v $(pwd)/data:/app/data \
-  -e LOGIN_PASSWORD=admin123 \
-  -e SECRET_KEY=your-secret-key-here \
-  ghcr.io/assast/outlookemail:latest
+```bash
+cp .env.example .env
+# 编辑 .env，填写 SECRET_KEY、Pocket ID Client ID、Client Secret 和网站回调 URL
+docker compose pull
+docker compose up -d
 ```
 
 ### 方式四：使用 Python 直接运行
 
 ```bash
-git clone https://github.com/assast/outlookEmail.git
+git clone https://github.com/Jackchen002/outlookEmail.git
 cd outlookEmail
 pip install -r requirements.txt
-export SECRET_KEY=your-secret-key-here
+cp .env.example .env
+# 编辑 .env 后启动；应用会自动读取该文件
 python web_outlook_app.py
 ```
 
-python -m pip install -r requirements.txt; $env:SECRET_KEY = (& python -c "import secrets; print(secrets.token_hex(32))")[0]; $env:HOST="127.0.0.1"; python web_outlook_app.py
-
-访问 `http://localhost:5000` 即可使用。
-如果是服务器部署，仍然建议显式设置固定 `SECRET_KEY`。
+访问网站后，在默认登录页点击“登录”并通过 Pocket ID 验证。服务器部署必须固定 `SECRET_KEY` 并使用 HTTPS。
 
 ### 运行模式
 
@@ -84,25 +72,12 @@ python -m pip install -r requirements.txt; $env:SECRET_KEY = (& python -c "impor
 
 ### 使用 Docker Compose
 
-```yaml
-version: '3.8'
-services:
-  outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
-    container_name: outlook-mail-reader
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - LOGIN_PASSWORD=admin123
-      - SECRET_KEY=your-secret-key-here
-      - FLASK_ENV=production
-    restart: unless-stopped
-```
+仓库中的 `docker-compose.yml` 会从 `.env` 注入 Pocket ID 参数：
 
 ```bash
-docker-compose up -d
+cp .env.example .env
+# 编辑 .env 后启动
+docker compose up -d
 ```
 
 #### 可选：启用界面 Docker 在线更新 + 使用自己的 Client ID 和回调 URL
@@ -120,16 +95,16 @@ docker-compose up -d
 version: '3.8'
 services:
   outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:latest
+    image: ghcr.io/jackchen002/outlookemail:latest
     container_name: outlook-mail-reader
     ports:
       - "5000:5000"
     volumes:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
     environment:
-      - LOGIN_PASSWORD=admin123
-      - SECRET_KEY=your-secret-key-here
       - FLASK_ENV=production
       - DOCKER_UPDATE_ENABLED=true
       - DOCKER_UPDATE_CONTAINER=outlook-mail-reader
@@ -155,7 +130,7 @@ services:
 cp .env.example .env.local
 ```
 
-至少修改以下两项：
+至少修改以下配置：
 
 ```bash
 # 生成随机串后填入 .env.local 的 SECRET_KEY
@@ -163,7 +138,10 @@ python -c 'import secrets; print(secrets.token_hex(32))'
 ```
 
 - `SECRET_KEY`：填入上面生成的随机串（务必修改，勿用占位值；首尾空白会被忽略）
-- `LOGIN_PASSWORD`：首次初始化时的登录密码，默认 `admin123`，建议改为强密码；**已写入数据库后**再改此变量不会覆盖当前密码。忘记密码请用 `scripts/reset_login_password.py`（见 [故障排除](docs/troubleshooting.md) / [安全配置](docs/security.md)）
+- `POCKET_ID_URL`：`https://sso.jackyccc.com`
+- `POCKET_ID_CLIENT_ID` / `POCKET_ID_CLIENT_SECRET`：Pocket ID OIDC Client 凭据
+- `POCKET_ID_REDIRECT_URI`：应用的 HTTPS 回调地址，路径固定为 `/auth/pocket-id/callback`
+- `LOGIN_PASSWORD`：仅用于导出、查看账号密码、WebDAV 配置等敏感操作的二次确认，不用于网站登录
 
 可选：如需调整 Gunicorn 线程数 / 超时，在 `.env.local` 中追加 `GUNICORN_THREADS`、`GUNICORN_TIMEOUT`（不填则使用默认值 4 / 300）。
 
@@ -179,7 +157,7 @@ docker compose -f docker-compose.build.yml up -d --build
 - 容器名为 `outlook-mail`，映射端口 `5000:5000`
 - 数据持久化在宿主机 `./data`；`./static`、`./templates` 以只读方式挂载，便于本地编辑模板/静态资源实时生效
 
-启动后访问 `http://localhost:5000`，使用 `.env.local` 中的 `LOGIN_PASSWORD` 登录。
+启动后访问网站，在默认登录页点击“登录”并通过 Pocket ID 验证。
 
 #### 步骤 3：常用运维命令
 
@@ -226,7 +204,7 @@ Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件�
 ### Web 应用功能
 
 #### 核心功能
-- 🔐 **登录验证** - 密码保护的 Web 界面，支持在线修改密码；忘记密码可用官方脚本 `scripts/reset_login_password.py` 重置（见 [故障排除](docs/troubleshooting.md)）
+- 🔐 **登录验证** - 通过 Pocket ID OpenID Connect 登录，不接受网站密码登录
 - 📁 **分组管理** - 支持最多三级树形邮箱分组，创建、编辑、折叠展开、同级排序、跨层级拖拽移动和级联删除
 - 🌐 **账号/分组代理** - 每个分组可配置 HTTP/SOCKS5 代理，子分组可继承父级代理，单个账号也可设置代理并优先覆盖分组代理；代理 URL 支持 `{mail}` 占位符（对接 [Resin](https://github.com/Resinat/Resin) 等粘性代理池）
 - 📧 **多邮箱管理** - 批量导入和管理 Outlook/Hotmail OAuth / IMAP 邮箱账号
@@ -242,7 +220,7 @@ Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件�
 - ⚡ **性能优化** - 邮件列表与账号列表缓存，分组切换和账号切换更快
 - 📄 **分页加载** - 滚动到底部自动加载下一页（每页20封）
 - 🔥 **临时邮箱** - 集成 GPTMail + DuckMail + Cloudflare Temp Email，多提供商生成、导入、读取、查看详情；Cloudflare 支持多渠道配置，每个 Worker/管理员密码/邮件池独立管理，并按渠道查看全部邮件
-- ⚙️ **系统设置** - 在线修改密码、API Key、邮件获取超时等
+- ⚙️ **系统设置** - 在线管理敏感操作确认密码、API Key、邮件获取超时等
 - 🔄 **OAuth2 助手** - 内置授权流程，快速获取 Refresh Token
 - 💾 **邮件缓存** - 智能缓存邮件列表，切换即时展示；普通邮箱本地保留默认关闭，可在设置页开启、查看统计并清理本地保留缓存
 - 🏷️ **标签管理** - 支持给邮箱打标签、批量操作、按标签筛选
@@ -250,7 +228,7 @@ Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件�
 - ✅ **批量选择** - 邮箱列表、邮件列表均支持全选当前列表与清空选择
 - 🗑️ **邮件删除** - 单封/批量永久删除；Graph 与 IMAP（含标准 IMAP 账号、OAuth IMAP 回退）均支持
 - 🔄 **API 优先级回退** - Outlook OAuth 默认 Graph API → IMAP(新) → IMAP(旧)；可按账号记录首选通道，失败后仍自动回退并记住实际成功通道
-- 🔑 **对外 API** - 通过 API Key 直接获取邮件，无需登录，支持别名邮箱、聚合文件夹和多条件筛选 带+号的附加电子邮箱自动识别，自动回退主邮箱/别名邮箱查询；如果要求的功能比较完善，建议直接对接完整API，文档已经改成了适合AI读取的形状，直接喂给AI让AI按照完整API使用登录密码而不是API Key对接即可
+- 🔑 **对外 API** - 通过 API Key 直接获取邮件，无需 Web 登录，支持别名邮箱、聚合文件夹和多条件筛选
 
 #### 邮件转发
 - 📮 **按账号开启转发** - 每个账号单独控制是否参与自动转发
@@ -557,9 +535,9 @@ socks5h://outlook.{mail}@127.0.0.1:2260
 - 「手动上传」会立即上传真实备份文件，需要输入登录密码
 - WebDAV 备份涉及账号、令牌、临时邮箱凭据等敏感数据，建议使用专用 WebDAV 目录并控制访问权限
 
-### 8. 浏览器扩展（密码版）
+### 8. 浏览器扩展（Pocket ID 版）
 
-仓库内置 Chrome / Edge Manifest V3 扩展，目录为 `browser-extension/`。扩展使用 Web 端登录密码，不需要对外 API Key。
+仓库内置 Chrome / Edge Manifest V3 扩展，目录为 `browser-extension/`。扩展复用 Pocket ID 建立的 Web Session，不需要对外 API Key，也不保存登录密码。
 
 安装方式：
 
@@ -571,8 +549,8 @@ socks5h://outlook.{mail}@127.0.0.1:2260
 使用方式：
 
 1. 点击扩展图标
-2. 填写 OutlookEmail 服务地址和 Web 登录密码
-3. 点击“保存配置”，或直接点侧边栏里的功能入口
+2. 填写 OutlookEmail 服务地址
+3. 打开登录页并完成 Pocket ID 验证，然后返回侧边栏刷新
 
 扩展会在浏览器侧边栏内提供原生操作面板，当前网页标签不会被切走。现在可直接使用邮箱、导入、刷新、Token、导出、标签和设置等功能。完整安装、配置、功能和故障排查说明见 [浏览器扩展使用说明](browser-extension/README.md)。
 
