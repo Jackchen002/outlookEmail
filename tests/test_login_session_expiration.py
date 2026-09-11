@@ -126,6 +126,17 @@ class LoginSessionExpirationTests(unittest.TestCase):
         self.assertIn('>登 录</button>', source)
         self.assertEqual(self.client.post('/login', json={'password': 'anything'}).status_code, 405)
 
+    def test_favicon_redirects_to_requested_svg_url(self):
+        response = self.client.get('/favicon.ico', follow_redirects=False)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers['Location'],
+            'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/gmail-cleaner.svg',
+        )
+
+        login_source = self.client.get('/login').get_data(as_text=True)
+        self.assertIn('<link rel="icon" href="/favicon.ico" type="image/svg+xml">', login_source)
+
     def test_pocket_id_start_uses_configured_callback_and_duration(self):
         fake_client = FakePocketIdClient()
         with self.oidc_config(fake_client):

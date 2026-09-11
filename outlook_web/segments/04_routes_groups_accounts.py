@@ -174,17 +174,13 @@ def api_extension_login():
     })
 
 
+FAVICON_URL = 'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/gmail-cleaner.svg'
+
+
 @app.route('/favicon.ico')
 def favicon():
-    """返回内联 SVG favicon，避免 500 错误"""
-    svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-        <rect width="100" height="100" rx="20" fill="#1a1a1a"/>
-        <text x="50" y="55" font-size="60" text-anchor="middle" dominant-baseline="middle">📧</text>
-    </svg>'''
-    response = make_response(svg)
-    response.headers['Content-Type'] = 'image/svg+xml'
-    response.headers['Cache-Control'] = 'public, max-age=31536000'
-    return response
+    """将浏览器 favicon 请求重定向到统一的外部图标。"""
+    return redirect(FAVICON_URL)
 
 
 @app.route('/assets/index.css')
