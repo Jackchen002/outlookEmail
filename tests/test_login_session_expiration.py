@@ -126,17 +126,16 @@ class LoginSessionExpirationTests(unittest.TestCase):
         self.assertIn('>登 录</button>', source)
         self.assertEqual(self.client.post('/login', json={'password': 'anything'}).status_code, 405)
 
-    def test_favicon_redirects_to_requested_svg_url(self):
+    def test_favicon_is_served_from_local_static_assets(self):
         response = self.client.get('/favicon.ico', follow_redirects=False)
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(
-            response.headers['Location'],
-            'https://cdn.jsdelivr.net/gh/selfhst/icons/svg/gmail-cleaner.svg',
-        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.content_type.startswith('image/svg+xml'))
+        self.assertIn(b'<svg', response.data)
+        self.assertNotIn(b'https://', response.data)
 
         login_source = self.client.get('/login').get_data(as_text=True)
         self.assertIn(
-            '<link rel="icon" href="/favicon.ico?v=gmail-cleaner" type="image/svg+xml">',
+            '<link rel="icon" href="/favicon.ico?v=gmail-cleaner-local" type="image/svg+xml">',
             login_source,
         )
 
