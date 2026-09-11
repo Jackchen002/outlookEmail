@@ -135,7 +135,10 @@ class LoginSessionExpirationTests(unittest.TestCase):
         )
 
         login_source = self.client.get('/login').get_data(as_text=True)
-        self.assertIn('<link rel="icon" href="/favicon.ico" type="image/svg+xml">', login_source)
+        self.assertIn(
+            '<link rel="icon" href="/favicon.ico?v=gmail-cleaner" type="image/svg+xml">',
+            login_source,
+        )
 
     def test_pocket_id_start_uses_configured_callback_and_duration(self):
         fake_client = FakePocketIdClient()
