@@ -1774,6 +1774,8 @@
                     populateTimeZoneOptions(appTimeZone);
                     document.getElementById('settingsApiKey').value = data.settings.gptmail_api_key || '';
                     document.getElementById('settingsExternalApiKey').value = data.settings.external_api_key || '';
+                    document.getElementById('settingsExternalApiKeyPermission').value =
+                        data.settings.external_api_key_permission === 'readwrite' ? 'readwrite' : 'readonly';
                     document.getElementById('settingsDuckmailBaseUrl').value = data.settings.duckmail_base_url || '';
                     document.getElementById('settingsDuckmailApiKey').value = data.settings.duckmail_api_key || '';
                     document.getElementById('settingsCloudflareAiEnabled').checked = String(data.settings.cloudflare_ai_username_enabled) === 'true';
@@ -1800,6 +1802,7 @@
                     document.getElementById('settingsShowAccountCreatedAt').checked = String(data.settings.show_account_created_at) !== 'false';
                     document.getElementById('settingsShowAccountSortOrder').checked = String(data.settings.show_account_sort_order) === 'true';
                     document.getElementById('settingsShowGroupId').checked = String(data.settings.show_group_id) !== 'false';
+                    document.getElementById('settingsShowProjectManagement').checked = String(data.settings.show_project_management) === 'true';
                     const retentionEnabled = parseSettingsBoolean(data.settings.normal_mail_local_retention_enabled);
                     document.getElementById('normalMailLocalRetentionEnabled').checked = retentionEnabled;
                     setNormalMailLocalRetentionEnabled(retentionEnabled);
@@ -1810,6 +1813,7 @@
                     document.getElementById('forwardAccountDelaySeconds').value = data.settings.forward_account_delay_seconds || '0';
                     document.getElementById('forwardEmailWindowMinutes').value = data.settings.forward_email_window_minutes || '0';
                     document.getElementById('forwardIncludeJunkemail').checked = String(data.settings.forward_include_junkemail) === 'true';
+                    document.getElementById('forwardKeywords').value = data.settings.forward_keywords || '';
                     document.getElementById('settingsEmailForwardRecipient').value = data.settings.email_forward_recipient || '';
                     document.getElementById('settingsSmtpHost').value = data.settings.smtp_host || '';
                     document.getElementById('settingsSmtpPort').value = data.settings.smtp_port || '465';
@@ -1863,6 +1867,7 @@
             const showAccountCreatedAt = !!document.getElementById('settingsShowAccountCreatedAt')?.checked;
             const showAccountSortOrder = !!document.getElementById('settingsShowAccountSortOrder')?.checked;
             const showGroupId = !!document.getElementById('settingsShowGroupId')?.checked;
+            const showProjectManagement = !!document.getElementById('settingsShowProjectManagement')?.checked;
             const normalMailLocalRetentionEnabled = !!document.getElementById('normalMailLocalRetentionEnabled')?.checked;
             const settings = {};
             const forwardChannels = getSelectedForwardChannels();
@@ -1882,6 +1887,7 @@
 
             settings.gptmail_api_key = apiKey;
             settings.external_api_key = externalApiKey;
+            settings.external_api_key_permission = document.getElementById('settingsExternalApiKeyPermission')?.value || 'readonly';
             settings.duckmail_base_url = document.getElementById('settingsDuckmailBaseUrl').value.trim();
             settings.duckmail_api_key = document.getElementById('settingsDuckmailApiKey').value.trim();
             settings.cloudflare_ai_username_enabled = !!document.getElementById('settingsCloudflareAiEnabled')?.checked;
@@ -2026,6 +2032,7 @@
             settings.show_account_created_at = showAccountCreatedAt;
             settings.show_account_sort_order = showAccountSortOrder;
             settings.show_group_id = showGroupId;
+            settings.show_project_management = showProjectManagement;
             settings.normal_mail_local_retention_enabled = normalMailLocalRetentionEnabled;
             settings.forward_channels = forwardChannels;
             settings.forward_check_interval_seconds = forwardSeconds;
@@ -2035,6 +2042,7 @@
             settings.forward_account_delay_seconds = forwardAccountDelaySeconds;
             settings.forward_email_window_minutes = forwardWindowMinutes;
             settings.forward_include_junkemail = forwardIncludeJunkemail;
+            settings.forward_keywords = document.getElementById('forwardKeywords').value;
             settings.email_forward_recipient = smtpRecipient;
             settings.smtp_host = smtpHost;
             settings.smtp_port = Number.isNaN(smtpPort) ? 465 : smtpPort;
@@ -2102,6 +2110,7 @@
             setShowAccountCreatedAt(showAccountCreatedAt);
             setShowAccountSortOrder(showAccountSortOrder);
             setShowGroupId(showGroupId);
+            setShowProjectManagement(showProjectManagement);
             setMailFetchTimeoutSeconds(mailFetchTimeoutSeconds);
             setNormalMailLocalRetentionEnabled(normalMailLocalRetentionEnabled);
             if (wasRetentionEnabled && !normalMailLocalRetentionEnabled

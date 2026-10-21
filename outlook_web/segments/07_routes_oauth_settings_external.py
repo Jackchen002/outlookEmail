@@ -590,6 +590,8 @@ def api_get_settings():
             settings['login_password_masked'] = '*' * len(pwd)
     # 返回解密后的对外 API Key
     settings['external_api_key'] = get_external_api_key()
+    # 返回对外 API Key 权限级别（未配置时默认 readonly）
+    settings['external_api_key_permission'] = get_external_api_key_permission()
     # 返回 DuckMail 设置
     settings['duckmail_base_url'] = get_duckmail_base_url()
     settings['duckmail_api_key'] = get_duckmail_api_key()
@@ -611,6 +613,7 @@ def api_get_settings():
     settings['show_account_created_at'] = get_setting('show_account_created_at', 'true')
     settings['show_account_sort_order'] = get_setting('show_account_sort_order', 'false')
     settings['show_group_id'] = get_setting('show_group_id', 'true')
+    settings['show_project_management'] = get_setting('show_project_management', 'false')
     settings['mail_fetch_timeout_seconds'] = str(get_mail_fetch_timeout_seconds())
     settings['normal_mail_local_retention_enabled'] = get_setting(
         'normal_mail_local_retention_enabled',
@@ -632,6 +635,7 @@ def api_get_settings():
     )
     settings['forward_email_window_minutes'] = get_setting('forward_email_window_minutes', '0')
     settings['forward_include_junkemail'] = get_setting('forward_include_junkemail', 'false')
+    settings['forward_keywords'] = get_setting('forward_keywords', '')
     settings['email_forward_recipient'] = get_setting('email_forward_recipient', '')
     settings['smtp_host'] = get_setting('smtp_host', '')
     settings['smtp_port'] = get_setting('smtp_port', '465')
@@ -841,6 +845,16 @@ def api_update_settings():
         else:
             errors.append('组ID展示必须是 true 或 false')
 
+    if 'show_project_management' in data:
+        show_project_management = str(data['show_project_management']).lower()
+        if show_project_management in ('true', 'false'):
+            if set_setting('show_project_management', show_project_management):
+                updated.append('项目管理入口展示')
+            else:
+                errors.append('更新项目管理入口展示失败')
+        else:
+            errors.append('项目管理入口展示必须是 true 或 false')
+
     if 'normal_mail_local_retention_enabled' in data:
         retention_enabled = str(data['normal_mail_local_retention_enabled']).strip().lower()
         if retention_enabled in ('true', 'false'):
@@ -874,6 +888,16 @@ def api_update_settings():
         else:
             if set_setting('external_api_key', ''):
                 updated.append('对外 API Key（已清空）')
+
+    # 更新对外 API Key 权限
+    if 'external_api_key_permission' in data:
+        new_permission = str(data.get('external_api_key_permission') or '').strip().lower()
+        if new_permission not in EXTERNAL_API_KEY_PERMISSIONS:
+            return jsonify({'success': False, 'error': '对外 API Key 权限必须是 readonly 或 readwrite'}), 400
+        if set_setting('external_api_key_permission', new_permission):
+            updated.append('对外 API Key 权限')
+        else:
+            errors.append('更新对外 API Key 权限失败')
 
     # 更新 DuckMail 设置
     if 'duckmail_base_url' in data:
@@ -1036,6 +1060,14 @@ def api_update_settings():
                 errors.append('保存转发邮件时间范围失败')
         except ValueError:
             errors.append('转发邮件时间范围必须是数字')
+
+    if 'forward_keywords' in data:
+        if not isinstance(data['forward_keywords'], str):
+            errors.append('转发关键词必须为文本，每行一个关键词')
+        elif set_setting('forward_keywords', '\n'.join(normalize_forward_keywords(data['forward_keywords']))):
+            updated.append('转发关键词筛选')
+        else:
+            errors.append('保存转发关键词筛选失败')
 
     if 'forward_include_junkemail' in data:
         include_junk = str(data['forward_include_junkemail']).lower()

@@ -564,31 +564,54 @@ def finalize_aborted_retry_refresh(conn, log_refresh_type: str,
     }
 
 
+def build_refresh_success_message(token_rotated: Optional[bool]) -> str:
+    if token_rotated is True:
+        return '刷新成功，Token 已更新'
+    if token_rotated is False:
+        return '验证成功，Token 未轮换，继续使用原 Token'
+    return '刷新成功（轮换结果未记录）'
+
+
+def get_account_refresh_timestamps(account_id: int, db_conn=None) -> Dict[str, Any]:
+    db = db_conn or get_db()
+    row = db.execute(
+        'SELECT last_refresh_at, last_refresh_success_at, refresh_token_updated_at '
+        'FROM accounts WHERE id = ?', (account_id,),
+    ).fetchone()
+    return dict(row) if row is not None else {}
+
+
 def log_refresh_result(account_id: int, account_email: str, refresh_type: str, status: str,
-                       error_message: str = None, db_conn=None):
+                       error_message: str = None, db_conn=None, token_rotated: Optional[bool] = None):
     """记录刷新结果到数据库"""
     db = db_conn or get_db()
     should_commit = db_conn is None
     normalized_status = 'success' if str(status or '').strip().lower() == 'success' else 'failed'
     sanitized_error = sanitize_error_details(error_message)[:500] if error_message else None
+    rotation_value = int(token_rotated) if token_rotated is not None else None
     try:
         db.execute('''
-            INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (account_id, account_email, refresh_type, normalized_status, sanitized_error))
+            INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message, token_rotated)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (account_id, account_email, refresh_type, normalized_status, sanitized_error, rotation_value))
 
         db.execute(
             '''
             UPDATE accounts
             SET last_refresh_at = CURRENT_TIMESTAMP,
+                last_refresh_success_at = CASE WHEN ? = 'success'
+                    THEN CURRENT_TIMESTAMP ELSE last_refresh_success_at END,
                 last_refresh_status = ?,
                 last_refresh_error = ?,
+                last_refresh_token_rotated = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             ''',
             (
                 normalized_status,
+                normalized_status,
                 sanitized_error if normalized_status == 'failed' else None,
+                rotation_value,
                 account_id,
             )
         )
@@ -615,7 +638,7 @@ def persist_rotated_refresh_token(account_id: int, refresh_token: str, db_conn=N
     db = db_conn or get_db()
     should_commit = db_conn is None
     try:
-        db.execute(
+        cursor = db.execute(
             '''
             UPDATE accounts
             SET refresh_token = ?, refresh_token_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -625,7 +648,7 @@ def persist_rotated_refresh_token(account_id: int, refresh_token: str, db_conn=N
         )
         if should_commit:
             db.commit()
-        return True
+        return cursor.rowcount == 1
     except Exception as e:
         if should_commit:
             try:
@@ -696,11 +719,7 @@ def test_refresh_token(client_id: str, refresh_token: str, proxy_url: str = None
                 errors.append(f'Graph 刷新请求异常: {str(exc)}')
                 continue
             if response.status_code == 200:
-                try:
-                    payload = response.json()
-                except Exception:
-                    payload = {}
-                return True, None, str(payload.get('refresh_token') or '').strip(), 'graph'
+                return True, None, extract_refresh_token_from_response(response), 'graph'
             errors.append(f'Graph 刷新失败: {extract_token_response_error(response)}')
             continue
 
@@ -715,11 +734,7 @@ def test_refresh_token(client_id: str, refresh_token: str, proxy_url: str = None
             errors.append(f'IMAP 刷新请求异常: {str(exc)}')
             continue
         if response.status_code == 200:
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {}
-            return True, None, str(payload.get('refresh_token') or '').strip(), 'imap'
+            return True, None, extract_refresh_token_from_response(response), 'imap'
         errors.append(f'IMAP 刷新失败: {extract_token_response_error(response)}')
 
     return False, '; '.join(errors) or 'Graph/IMAP 刷新失败', '', ''
@@ -759,9 +774,12 @@ def refresh_outlook_account_token(account: sqlite3.Row, refresh_type: str = 'man
         refresh_token = decrypt_data(encrypted_refresh_token) if encrypted_refresh_token else encrypted_refresh_token
     except Exception as e:
         error_msg = sanitize_error_details(f"解密 token 失败: {str(e)}")
-        log_refresh_result(account_id, account_email, refresh_type, 'failed', error_msg, db_conn=db_conn)
+        log_refresh_result(account_id, account_email, refresh_type, 'failed', error_msg,
+                           db_conn=db_conn, token_rotated=False)
         return {
             'success': False,
+            'token_rotated': False,
+            **get_account_refresh_timestamps(account_id, db_conn),
             'error_message': error_msg,
             'error_payload': build_error_payload(
                 "TOKEN_DECRYPT_FAILED",
@@ -787,8 +805,12 @@ def refresh_outlook_account_token(account: sqlite3.Row, refresh_type: str = 'man
     actual_channel = normalize_outlook_authorization_type(actual_channel)
     sanitized_error = sanitize_error_details(error_msg) if error_msg else ''
 
+    token_rotated = False
     if success and rotated_refresh_token and rotated_refresh_token != refresh_token:
-        persist_rotated_refresh_token(account_id, rotated_refresh_token, db_conn)
+        token_rotated = persist_rotated_refresh_token(account_id, rotated_refresh_token, db_conn)
+        if not token_rotated:
+            success = False
+            sanitized_error = '已获取新 Token，但保存失败，请重试'
     if success and actual_channel:
         try:
             update_account_authorization_type(account_id, actual_channel, db=db_conn)
@@ -802,18 +824,24 @@ def refresh_outlook_account_token(account: sqlite3.Row, refresh_type: str = 'man
         refresh_type,
         'success' if success else 'failed',
         sanitized_error or None,
-        db_conn=db_conn
+        db_conn=db_conn,
+        token_rotated=token_rotated,
     )
+    refresh_timestamps = get_account_refresh_timestamps(account_id, db_conn)
 
     if success:
         return {
             'success': True,
-            'message': 'Token 刷新成功',
+            'message': build_refresh_success_message(token_rotated),
+            'token_rotated': token_rotated,
+            **refresh_timestamps,
             'authorization_type': actual_channel,
         }
 
     return {
         'success': False,
+        'token_rotated': token_rotated,
+        **refresh_timestamps,
         'error_message': sanitized_error or '未知错误',
         'authorization_type': actual_channel,
         'error_payload': build_error_payload(
@@ -854,9 +882,18 @@ def api_refresh_account(account_id):
 
     cleanup_refresh_logs()
     result = refresh_outlook_account_token(account, 'manual')
+    payload = {
+        'success': result['success'],
+        'token_rotated': result.get('token_rotated'),
+        'last_refresh_at': result.get('last_refresh_at'),
+        'last_refresh_success_at': result.get('last_refresh_success_at'),
+        'refresh_token_updated_at': result.get('refresh_token_updated_at'),
+    }
     if result['success']:
-        return jsonify({'success': True, 'message': result['message']})
-    return jsonify({'success': False, 'error': result['error_payload']})
+        payload['message'] = result['message']
+    else:
+        payload['error'] = result['error_payload']
+    return jsonify(payload)
 
 
 @app.route('/api/accounts/refresh-selected', methods=['POST'])
@@ -898,6 +935,8 @@ def api_refresh_selected_accounts():
 
     found_ids = {row['id'] for row in accounts}
     success_count = 0
+    rotated_count = 0
+    unrotated_count = 0
     failed_count = 0
     skipped_count = 0
     failed_list = []
@@ -925,6 +964,10 @@ def api_refresh_selected_accounts():
         result = refresh_outlook_account_token(account, 'manual')
         if result['success']:
             success_count += 1
+            if result.get('token_rotated') is True:
+                rotated_count += 1
+            elif result.get('token_rotated') is False:
+                unrotated_count += 1
             continue
 
         failed_count += 1
@@ -948,6 +991,8 @@ def api_refresh_selected_accounts():
         'requested_count': requested_count,
         'processed_count': processed_count,
         'success_count': success_count,
+        'rotated_count': rotated_count,
+        'unrotated_count': unrotated_count,
         'failed_count': failed_count,
         'skipped_count': skipped_count,
         'failed_list': failed_list,
@@ -1013,6 +1058,26 @@ def get_refresh_delay_seconds(db_conn) -> int:
         return max(0, min(60, int(row['value']) if row and row['value'] is not None else 5))
     except (TypeError, ValueError):
         return 5
+
+
+def build_refresh_account_result_event(account, result: Dict[str, Any], current: int, total: int,
+                                       success_count: int, failed_count: int) -> Dict[str, Any]:
+    return {
+        'type': 'account_result',
+        'current': current,
+        'total': total,
+        'account_id': account['id'],
+        'email': account['email'],
+        'status': 'success' if result.get('success') else 'failed',
+        'error_message': result.get('error_message') or '',
+        'message': result.get('message') or '',
+        'token_rotated': result.get('token_rotated'),
+        'last_refresh_at': result.get('last_refresh_at'),
+        'last_refresh_success_at': result.get('last_refresh_success_at'),
+        'refresh_token_updated_at': result.get('refresh_token_updated_at'),
+        'success_count': success_count,
+        'failed_count': failed_count,
+    }
 
 
 def run_full_refresh(snapshot_trigger_type: str, log_refresh_type: str,
@@ -1095,17 +1160,9 @@ def run_full_refresh(snapshot_trigger_type: str, log_refresh_type: str,
                 })
             current_account_counted = True
             if progress_callback:
-                progress_callback({
-                    'type': 'account_result',
-                    'current': index,
-                    'total': total,
-                    'account_id': account['id'],
-                    'email': account['email'],
-                    'status': 'success' if result.get('success') else 'failed',
-                    'error_message': result.get('error_message') or '',
-                    'success_count': success_count,
-                    'failed_count': failed_count,
-                })
+                progress_callback(build_refresh_account_result_event(
+                    account, result, index, total, success_count, failed_count,
+                ))
             if is_token_refresh_stop_requested():
                 stopped_payload = finalize_stopped_full_refresh(
                     conn,
@@ -1251,7 +1308,8 @@ def stream_full_refresh_events(snapshot_trigger_type: str, log_refresh_type: str
                     'error': result.get('error_message') or '未知错误',
                 })
             current_account_counted = True
-            yield f"data: {json.dumps({'type': 'account_result', 'current': index, 'total': total, 'account_id': account['id'], 'email': account['email'], 'status': 'success' if result.get('success') else 'failed', 'error_message': result.get('error_message') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
+            event = build_refresh_account_result_event(account, result, index, total, success_count, failed_count)
+            yield f"data: {json.dumps(event)}\n\n"
             if is_token_refresh_stop_requested():
                 stopped_payload = finalize_stopped_full_refresh(
                     conn,
@@ -1374,7 +1432,8 @@ def stream_failed_refresh_events():
                 })
             current_account_counted = True
 
-            yield f"data: {json.dumps({'type': 'account_result', 'current': index, 'total': total, 'account_id': account['id'], 'email': account['email'], 'status': 'success' if result.get('success') else 'failed', 'error_message': result.get('error_message') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
+            event = build_refresh_account_result_event(account, result, index, total, success_count, failed_count)
+            yield f"data: {json.dumps(event)}\n\n"
 
             if is_token_refresh_stop_requested():
                 yield f"data: {json.dumps(build_stopped_refresh_payload(total, success_count, failed_count, failed_list, delay_seconds=delay_seconds, refresh_type='retry_failed'))}\n\n"
@@ -1552,7 +1611,8 @@ def stream_selected_refresh_events(account_ids: List[int]):
                 })
             current_account_counted = True
 
-            yield f"data: {json.dumps({'type': 'account_result', 'current': index, 'total': total, 'account_id': account['id'], 'email': account['email'], 'status': 'success' if result.get('success') else 'failed', 'error_message': result.get('error_message') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
+            event = build_refresh_account_result_event(account, result, index, total, success_count, failed_count)
+            yield f"data: {json.dumps(event)}\n\n"
 
             if is_token_refresh_stop_requested():
                 yield f"data: {json.dumps(build_stopped_refresh_payload(total, success_count, failed_count, failed_list, delay_seconds=delay_seconds, refresh_type='manual_selected'))}\n\n"
@@ -1740,12 +1800,16 @@ def api_stop_full_refresh():
 
 def serialize_refresh_log_row(row):
     account_email = row['current_account_email'] or row['log_account_email']
+    token_rotated = bool(row['token_rotated']) if row['token_rotated'] is not None else None
     return {
         'id': row['id'],
         'account_id': row['account_id'],
         'account_email': account_email,
         'refresh_type': row['refresh_type'],
         'status': row['status'],
+        'token_rotated': token_rotated,
+        'message': (build_refresh_success_message(token_rotated) if row['status'] == 'success'
+                    else row['error_message'] or '刷新失败'),
         'error_message': row['error_message'],
         'created_at': row['created_at']
     }
@@ -1769,13 +1833,14 @@ def api_get_refresh_logs():
             a.email AS current_account_email,
             l.refresh_type,
             l.status,
+            l.token_rotated,
             l.error_message,
             l.created_at
         FROM account_refresh_logs l
         LEFT JOIN accounts a ON l.account_id = a.id
         WHERE l.refresh_type IN ('manual', 'scheduled')
         AND l.created_at >= datetime('now', '-6 months')
-        ORDER BY l.created_at DESC
+        ORDER BY l.created_at DESC, l.id DESC
         LIMIT ? OFFSET ?
     ''', (limit, offset))
 
@@ -1805,12 +1870,13 @@ def api_get_account_refresh_logs(account_id):
             a.email AS current_account_email,
             l.refresh_type,
             l.status,
+            l.token_rotated,
             l.error_message,
             l.created_at
         FROM account_refresh_logs l
         LEFT JOIN accounts a ON l.account_id = a.id
         WHERE l.account_id = ?
-        ORDER BY l.created_at DESC
+        ORDER BY l.created_at DESC, l.id DESC
         LIMIT ? OFFSET ?
     ''', (account_id, limit, offset))
 
@@ -2014,6 +2080,31 @@ def api_get_refresh_status_list():
 
 # ==================== Email Deletion Helpers ====================
 
+_GRAPH_DELETE_REAUTH_MARKERS = (
+    'authorization_requestdenied',
+    'erroraccessdenied',
+    'access is denied',
+    'insufficient privileges',
+    'authorization has been denied',
+    'mail.readwrite',
+)
+
+
+def is_graph_delete_reauthorization_error(status_code: Any, error_body: Any) -> bool:
+    """判断删除失败是否因为缺少邮件写权限或授权失效，需要重新授权。"""
+    try:
+        code = int(status_code or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in {401, 403}:
+        return True
+    try:
+        details_text = json.dumps(error_body, ensure_ascii=True).lower()
+    except Exception:
+        details_text = str(error_body or '').lower()
+    return any(marker in details_text for marker in _GRAPH_DELETE_REAUTH_MARKERS)
+
+
 def delete_emails_graph(client_id: str, refresh_token: str, message_ids: List[str], proxy_url: str = None,
                         fallback_proxy_urls: List[str] = None) -> Dict[str, Any]:
     """通过 Graph API 批量删除邮件（永久删除）"""
@@ -2067,25 +2158,56 @@ def delete_emails_graph(client_id: str, refresh_token: str, message_ids: List[st
                 proxy_url=proxy_url,
                 fallback_proxy_urls=fallback_proxy_urls,
             )
-
-            if response.status_code == 200:
-                results = response.json().get("responses", [])
-                for res in results:
-                    msg_id = batch[int(res['id'])]
-                    if res.get("status") in [200, 204]:
-                        success_count += 1
-                        deleted_ids.append(str(msg_id))
-                    else:
-                        failed_count += 1
-                        # 记录具体错误
-                        errors.append(f"Msg ID: {msg_id}, Status: {res.get('status')}")
-            else:
-                failed_count += len(batch)
-                errors.append(f"Batch request failed: {response.text}")
-
-        except Exception as e:
+        except Exception as exc:
             failed_count += len(batch)
-            errors.append(f"Network error: {str(e)}")
+            error_payload = build_error_payload(
+                'EMAIL_DELETE_FAILED',
+                '删除邮件失败',
+                type(exc).__name__,
+                500,
+                str(exc),
+            )
+            errors.extend({'id': str(message_id), 'error': error_payload} for message_id in batch)
+            continue
+
+        if response.status_code != 200:
+            failed_count += len(batch)
+            error_payload = build_error_payload(
+                'EMAIL_DELETE_FAILED',
+                '删除邮件失败',
+                'GraphAPIError',
+                response.status_code,
+                get_response_details(response),
+            )
+            errors.extend({'id': str(message_id), 'error': error_payload} for message_id in batch)
+            continue
+
+        results = response.json().get("responses", [])
+        for res in results:
+            msg_id = batch[int(res['id'])]
+            status_code = int(res.get('status') or 0)
+            if status_code in (200, 204):
+                success_count += 1
+                deleted_ids.append(str(msg_id))
+            else:
+                failed_count += 1
+                error_body = res.get('body') or ''
+                if is_graph_delete_reauthorization_error(status_code, error_body):
+                    message = '删除邮件失败：账号缺少邮件写权限（Mail.ReadWrite）或授权已失效，请对该账号重新授权后重试'
+                    code = 'EMAIL_DELETE_REAUTH_REQUIRED'
+                else:
+                    message = '删除邮件失败'
+                    code = 'EMAIL_DELETE_FAILED'
+                errors.append({
+                    'id': str(msg_id),
+                    'error': build_error_payload(
+                        code,
+                        message,
+                        'GraphAPIError',
+                        status_code or 500,
+                        error_body or '批处理返回空响应',
+                    )
+                })
 
     return {
         "success": failed_count == 0,
@@ -2182,6 +2304,17 @@ def normalize_email_action_items(raw_items: Any, fallback_folder: str = 'inbox')
     return normalized_items
 
 
+def unwrap_email_action_error(entry: Any) -> Any:
+    """从 {'id': ..., 'error': ...} 包装条目中提取用户可见的错误信息。"""
+    if isinstance(entry, dict):
+        inner = entry.get('error')
+        if isinstance(inner, dict) and inner.get('message'):
+            return inner
+        if isinstance(inner, str) and inner.strip():
+            return inner
+    return entry
+
+
 def merge_email_action_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     merged_updated_ids: List[str] = []
     merged_deleted_ids: List[str] = []
@@ -2207,7 +2340,7 @@ def merge_email_action_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         'errors': merged_errors,
     }
     if merged_errors:
-        merged_result['error'] = merged_errors[0]
+        merged_result['error'] = unwrap_email_action_error(merged_errors[0])
     return merged_result
 
 
@@ -2938,7 +3071,8 @@ def build_retained_detail_success_response(account: Dict[str, Any], folder: str,
 
 def fetch_imap_account_detail_response(account: Dict[str, Any], folder: str,
                                        message_id: str, method: str,
-                                       id_mode: str, proxy_url: str) -> Dict[str, Any]:
+                                       id_mode: str, proxy_url: str,
+                                       strict_id_mode: bool = False) -> Dict[str, Any]:
     detail_result = get_email_detail_imap_generic_result(
         account['email'],
         account.get('imap_password', ''),
@@ -2947,7 +3081,8 @@ def fetch_imap_account_detail_response(account: Dict[str, Any], folder: str,
         message_id,
         folder,
         account.get('provider', 'custom'),
-        proxy_url
+        proxy_url,
+        strict_id_mode=strict_id_mode,
     )
     if detail_result.get('success'):
         return build_retained_detail_success_response(
@@ -2990,7 +3125,8 @@ def fetch_graph_detail_response(account: Dict[str, Any], folder: str,
 
 def fetch_oauth_imap_detail_response(account: Dict[str, Any], folder: str,
                                      message_id: str, method: str, id_mode: str,
-                                     proxy_url: str, fallback_proxy_urls: List[str]) -> Dict[str, Any]:
+                                     proxy_url: str, fallback_proxy_urls: List[str],
+                                     strict_id_mode: bool = False) -> Dict[str, Any]:
     requested_mode = str(id_mode or '').strip().lower()
     preferred_id_mode = requested_mode if requested_mode in {'uid', 'sequence'} else 'uid'
     detail_result = get_email_detail_imap_result(
@@ -3002,6 +3138,7 @@ def fetch_oauth_imap_detail_response(account: Dict[str, Any], folder: str,
         proxy_url,
         fallback_proxy_urls,
         preferred_id_mode,
+        strict_id_mode,
     )
     if not detail_result.get('success'):
         return {
@@ -3631,7 +3768,7 @@ def fetch_account_folder_emails(account: Dict[str, Any], folder: str, skip: int,
             account.get('provider', 'custom'),
             skip,
             top,
-            proxy_url
+            proxy_url,
         )
         if result.get('success'):
             return {
@@ -3837,6 +3974,101 @@ def api_get_emails(email_addr):
     return jsonify(result)
 
 
+def get_graph_send_mail_account_error(account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """确认账号可仅以自身 Graph 委托身份发信。"""
+    account_type = str(account.get('account_type') or '').strip().lower()
+    provider = str(account.get('provider') or '').strip().lower()
+    status = str(account.get('status') or '').strip().lower()
+    authorization_type = get_account_authorization_type(account)
+    if account_type != 'outlook' or provider != 'outlook' or status != 'active':
+        return build_graph_send_error_result(
+            'GRAPH_SEND_UNSUPPORTED_ACCOUNT',
+            '仅支持正常启用的 Outlook/Hotmail Graph 账号发信',
+            400,
+        )
+    if authorization_type == 'imap':
+        return build_graph_send_error_result(
+            'GRAPH_SEND_REAUTH_REQUIRED',
+            '此账号当前使用 IMAP 授权，请重新完成 Graph 授权后再试',
+            403,
+        )
+    if not str(account.get('client_id') or '').strip() or not str(account.get('refresh_token') or '').strip():
+        return build_graph_send_error_result(
+            'GRAPH_SEND_REAUTH_REQUIRED',
+            '此账号缺少可用的 Graph 授权，请重新完成 Graph 授权后再试',
+            403,
+        )
+    return None
+
+
+@app.route('/api/outlook/send-mail', methods=['POST'])
+@login_required
+def api_send_outlook_graph_mail():
+    """以选中 Outlook 账号自身身份提交一封基础纯文本邮件。"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        result = build_graph_send_error_result(
+            'GRAPH_SEND_INVALID_REQUEST',
+            '请求数据格式无效',
+            400,
+        )
+        return jsonify(result), 400
+
+    allowed_fields = {'account_id', 'recipients', 'subject', 'body'}
+    unsupported_fields = sorted(set(data) - allowed_fields)
+    if unsupported_fields:
+        result = build_graph_send_error_result(
+            'GRAPH_SEND_UNSUPPORTED_FIELD',
+            '基础写信不支持指定发件人、附件或富文本等字段',
+            400,
+            {'fields': unsupported_fields},
+        )
+        return jsonify(result), 400
+
+    raw_account_id = data.get('account_id')
+    try:
+        if isinstance(raw_account_id, bool):
+            raise ValueError
+        account_id = int(raw_account_id)
+    except (TypeError, ValueError):
+        account_id = 0
+    if account_id <= 0:
+        result = build_graph_send_error_result(
+            'GRAPH_SEND_INVALID_REQUEST',
+            '请选择有效的 Outlook 账号',
+            400,
+        )
+        return jsonify(result), 400
+
+    account = get_account_by_id(account_id)
+    if not account:
+        result = build_graph_send_error_result(
+            'ACCOUNT_NOT_FOUND',
+            '账号不存在',
+            404,
+        )
+        return jsonify(result), 404
+
+    account_error = get_graph_send_mail_account_error(account)
+    if account_error:
+        status_code = int(account_error['error'].get('status') or 400)
+        return jsonify(account_error), status_code
+
+    result = send_graph_mail_result(
+        account['client_id'],
+        account['refresh_token'],
+        data.get('recipients'),
+        data.get('subject'),
+        data.get('body'),
+        proxy_url=get_account_proxy_url(account),
+        fallback_proxy_urls=get_account_proxy_failover_urls(account),
+    )
+    if result.get('success'):
+        return jsonify(result), 202
+    status_code = int((result.get('error') or {}).get('status') or 502)
+    return jsonify(result), status_code
+
+
 @app.route('/api/emails/mark-read', methods=['POST'])
 @login_required
 def api_mark_emails_read():
@@ -4036,7 +4268,8 @@ def normalize_email_detail_error(error: Any, fallback_message: str = '获取邮�
 
 
 def fetch_email_detail_for_account(account, message_id, method='graph', folder='inbox',
-                                   id_mode='', prefer_local=False):
+                                   id_mode='', prefer_local=False, strict_id_mode=False,
+                                   force_method=False):
     proxy_url = get_account_proxy_url(account)
     fallback_proxy_urls = get_account_proxy_failover_urls(account)
 
@@ -4047,7 +4280,8 @@ def fetch_email_detail_for_account(account, message_id, method='graph', folder='
 
     if account.get('account_type') == 'imap':
         result = fetch_imap_account_detail_response(
-            account, folder, message_id, method, id_mode, proxy_url
+            account, folder, message_id, method, id_mode, proxy_url,
+            strict_id_mode=strict_id_mode,
         )
         if result.get('success'):
             return result
@@ -4061,7 +4295,9 @@ def fetch_email_detail_for_account(account, message_id, method='graph', folder='
     attempts: Dict[str, Any] = {}
     stored_channel = get_account_authorization_type(account)
     method_name = str(method or 'graph').strip().lower()
-    if stored_channel:
+    if force_method and method_name in {'graph', 'imap'}:
+        channel_order = (method_name,)
+    elif stored_channel:
         channel_order = get_outlook_mail_channel_order(account)
     elif method_name == 'imap':
         # 显式的 IMAP ID 可能是 UID/sequence，不能误传给 Graph。
@@ -4075,16 +4311,19 @@ def fetch_email_detail_for_account(account, message_id, method='graph', folder='
                 account, folder, message_id, 'graph', id_mode, proxy_url, fallback_proxy_urls
             )
             if graph_result.get('success'):
-                record_outlook_mail_channel(account, 'graph')
+                if not force_method:
+                    record_outlook_mail_channel(account, 'graph')
                 return graph_result
             attempts['graph'] = graph_result.get('error')
             continue
 
         imap_result = fetch_oauth_imap_detail_response(
-            account, folder, message_id, 'imap', id_mode, proxy_url, fallback_proxy_urls
+            account, folder, message_id, 'imap', id_mode, proxy_url, fallback_proxy_urls,
+            strict_id_mode=strict_id_mode,
         )
         if imap_result.get('success'):
-            record_outlook_mail_channel(account, 'imap')
+            if not force_method:
+                record_outlook_mail_channel(account, 'imap')
             return imap_result
         attempts['imap_new'] = imap_result.get('error')
 

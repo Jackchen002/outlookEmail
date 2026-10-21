@@ -260,6 +260,49 @@ class LoginSessionExpirationTests(unittest.TestCase):
         with self.client.session_transaction() as login_session:
             self.assertFalse(login_session.get('logged_in'))
 
+    def test_upstream_features_use_pocket_id_session_and_reject_logout(self):
+        endpoints = (
+            ('GET', '/api/projects', None),
+            ('GET', '/api/windows-update/status', None),
+            ('POST', '/api/outlook/send-mail', {}),
+        )
+        for method, path, payload in endpoints:
+            with self.subTest(stage='anonymous', path=path):
+                response = self.client.open(path, method=method, json=payload)
+                self.assertEqual(response.status_code, 401)
+                self.assertTrue(response.get_json()['need_login'])
+
+        with patch.object(web_outlook_app, 'get_login_session_now', return_value=1_700_000_000):
+            self.assertEqual(self._login(self.client, 1_700_000_000).status_code, 302)
+            self.assertEqual(self.client.get('/api/projects').status_code, 200)
+            self.assertEqual(self.client.get('/api/windows-update/status').status_code, 200)
+            # Empty input must reach mail validation without sending any email.
+            self.assertEqual(self.client.post('/api/outlook/send-mail', json={}).status_code, 400)
+            self.client.get('/logout')
+
+        for method, path, payload in endpoints:
+            with self.subTest(stage='logged_out', path=path):
+                self.assertEqual(self.client.open(path, method=method, json=payload).status_code, 401)
+
+    def test_default_update_repository_keeps_pocket_id_distribution(self):
+        import subprocess
+        import sys
+
+        environment = dict(os.environ)
+        for key in ('REPOSITORY_OWNER', 'REPOSITORY_NAME', 'REPOSITORY_URL'):
+            environment.pop(key, None)
+        environment['PYTHON_DOTENV_DISABLED'] = '1'
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'import web_outlook_app as app; '
+             'assert app.REPOSITORY_OWNER == "Jackchen002"; '
+             'assert app.REPOSITORY_NAME == "outlookEmail"; '
+             'assert app.REPOSITORY_URL == "https://github.com/Jackchen002/outlookEmail"'],
+            cwd=ROOT_DIR, env=environment, capture_output=True, text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_login_template_remembers_duration_without_password_storage(self):
         source = (ROOT_DIR / 'templates' / 'login.html').read_text(encoding='utf-8')
         self.assertIn("const LOGIN_DURATION_STORAGE_KEY = 'outlook_login_duration_days';", source)
