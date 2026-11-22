@@ -217,6 +217,7 @@ def index():
         app_version=APP_VERSION,
         changelog_url=CHANGELOG_URL,
         frontend_asset_hash=get_frontend_asset_hash(),
+        dompurify_asset_hash=get_dompurify_asset_hash(),
         skin_asset_hash=get_active_skin_asset_hash(),
         mail_fetch_timeout_seconds=get_mail_fetch_timeout_seconds(),
     ))
@@ -846,6 +847,30 @@ def api_get_accounts():
         list_args['limit'],
         list_args['offset'],
     ))
+
+
+@app.route('/api/accounts/reorder', methods=['POST'])
+@login_required
+def api_reorder_accounts():
+    """Persist a manual move independently of the existing account sort modes."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'error': '排序参数无效'}), 400
+    account_id, target_id = data.get('account_id'), data.get('target_id')
+    position = data.get('position')
+    if (type(account_id) is not int or type(target_id) is not int
+            or not 0 < account_id <= 9223372036854775807
+            or not 0 < target_id <= 9223372036854775807
+            or account_id == target_id or position not in ('before', 'after')):
+        return jsonify({'success': False, 'error': '排序参数无效'}), 400
+    try:
+        changes = reorder_account(account_id, target_id, position)
+        return jsonify({'success': True, 'manual_order': changes})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except sqlite3.Error:
+        app.logger.exception('保存邮箱手动排序失败')
+        return jsonify({'success': False, 'error': '保存排序失败，请稍后重试'}), 500
 
 
 @app.route('/api/external/accounts', methods=['GET'])
@@ -1897,11 +1922,14 @@ def api_get_account(account_id):
             'account_type': account.get('account_type', 'outlook'),
             'provider': account.get('provider', 'outlook'),
             'authorization_type': get_account_authorization_type(account),
+            'graph_token_scope': account.get('graph_token_scope', '') or '',
             'imap_host': account.get('imap_host', ''),
             'imap_port': account.get('imap_port', 993),
             'has_imap_password': bool(account.get('imap_password')),
             'imap_password': account.get('imap_password', '') or '',
             'aliases': account.get('aliases', []),
+            'managed_aliases': [row[0] for row in get_db().execute(
+                'SELECT alias_email FROM account_aliases WHERE account_id=? AND icloud_alias_id IS NOT NULL', (account_id,))],
             'alias_count': account.get('alias_count', 0),
             'matched_alias': account.get('matched_alias', ''),
             'forward_enabled': bool(account.get('forward_enabled')),
@@ -1991,7 +2019,9 @@ def api_add_account():
         imap_port = int(data.get('imap_port', 993) or 993)
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'IMAP 端口无效'})
-    
+
+    graph_token_scope = normalize_graph_token_scope(data.get('graph_token_scope', ''))
+
     if not account_str:
         return jsonify({'success': False, 'error': '请输入账号信息'})
     
@@ -2022,6 +2052,7 @@ def api_add_account():
         proxy_url,
         fallback_proxy_url_1,
         fallback_proxy_url_2,
+        graph_token_scope,
     )
     added = result.get('added_count', 0)
     skipped_count = result.get('skipped_count', 0)
@@ -2081,6 +2112,10 @@ def api_update_account(account_id):
             return jsonify({'success': False, 'error': str(exc)})
     else:
         authorization_type = get_account_authorization_type(current_account)
+    graph_token_scope = (
+        normalize_graph_token_scope(data.get('graph_token_scope'))
+        if 'graph_token_scope' in data else None
+    )
     imap_host = (data.get('imap_host', '') or '').strip()
     imap_port = data.get('imap_port', 993)
     imap_password = data['imap_password'] if 'imap_password' in data else current_account.get('imap_password', '')
@@ -2136,7 +2171,7 @@ def api_update_account(account_id):
         account_id, email_addr, password, client_id, refresh_token, group_id, sort_order, remark, status,
         account_type, provider, imap_host, imap_port, imap_password, forward_enabled,
         proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
-        authorization_type
+        authorization_type, graph_token_scope
     ):
         cleaned_aliases = get_account_aliases(account_id)
         db = get_db()

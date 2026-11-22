@@ -178,16 +178,12 @@ class ImapFolderResolutionTests(unittest.TestCase):
                 if command == 'FETCH':
                     uid = args[0]
                     uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
-                    if uid_text == '1':
-                        return 'OK', [(
-                            b'1 (FLAGS () INTERNALDATE "14-Apr-2026 10:00:00 +0000" RFC822 {128}',
-                            raw_old_header,
-                        )]
-                    if uid_text == '2':
-                        return 'OK', [(
-                            b'2 (FLAGS () INTERNALDATE "13-Apr-2026 10:00:00 +0000" RFC822 {128}',
-                            raw_new_header,
-                        )]
+                    return 'OK', [
+                        (b'1 (UID 1 FLAGS () INTERNALDATE "14-Apr-2026 10:00:00 +0000" BODY[HEADER] {128}', raw_old_header),
+                        b')',
+                        (b'2 (UID 2 FLAGS () INTERNALDATE "13-Apr-2026 10:00:00 +0000" BODY[HEADER] {128}', raw_new_header),
+                        b')',
+                    ]
                 return super().uid(command, *args, **kwargs)
 
         mail = GmailListMail(selectable={'INBOX'})
@@ -215,20 +211,15 @@ class ImapFolderResolutionTests(unittest.TestCase):
                 if command == 'FETCH':
                     uid = args[0]
                     uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
-                    minute = int(uid_text) % 60
-                    internal_date = f'14-Apr-2026 08:{minute:02d}:00 +0000'
-                    raw_email = (
-                        f"Subject: page message {uid_text}\r\n"
-                        "From: sender@example.com\r\n"
-                        "To: user@example.com\r\n"
-                        f"Date: Tue, 14 Apr 2026 08:{minute:02d}:00 +0000\r\n"
-                        "\r\n"
-                        "hello\r\n"
-                    ).encode('utf-8')
-                    return 'OK', [(
-                        f'{uid_text} (FLAGS () INTERNALDATE "{internal_date}" RFC822 {{{len(raw_email)}}}'.encode('utf-8'),
-                        raw_email,
-                    )]
+                    data = []
+                    for identifier in uid_text.split(','):
+                        minute = int(identifier) % 60
+                        raw_header = f'Subject: page message {identifier}\r\n\r\n'.encode()
+                        data.extend([(
+                            f'{identifier} (UID {identifier} FLAGS () INTERNALDATE "14-Apr-2026 08:{minute:02d}:00 +0000" BODY[HEADER] {{{len(raw_header)}}}'.encode(),
+                            raw_header,
+                        ), b')'])
+                    return 'OK', data
                 return super().uid(command, *args, **kwargs)
 
         def fetch_page(skip):
@@ -275,7 +266,7 @@ class ImapFolderResolutionTests(unittest.TestCase):
                 if command == 'FETCH':
                     return 'OK', [
                         (
-                            b'11 (INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                            b'11 (UID 11 INTERNALDATE "14-Apr-2026 08:20:50 +0000" BODY[HEADER] {128}',
                             raw_email,
                         ),
                         b' FLAGS (\\Seen))',
@@ -396,7 +387,7 @@ class ImapFolderResolutionTests(unittest.TestCase):
             def fetch(self, message_id, _query):
                 self.select_calls.append((f'FETCH:{message_id}', False))
                 return 'OK', [(
-                    b'7 (FLAGS (\\Seen) INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                    b'7 (UID 107 FLAGS (\\Seen) INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
                     raw_email,
                 )]
 
@@ -413,10 +404,11 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(len(result['emails']), 1)
-        self.assertEqual(result['emails'][0]['id'], '7')
+        self.assertEqual(result['emails'][0]['id'], '107')
+        self.assertEqual(result['emails'][0]['id_mode'], 'uid')
         self.assertEqual(result['emails'][0]['subject'], 'inbox message')
 
-    def test_custom_imap_detail_falls_back_to_plain_fetch_when_uid_fetch_fails(self):
+    def test_custom_imap_detail_does_not_fall_back_when_uid_fetch_fails(self):
         raw_email = (
             b"Subject: detail message\r\n"
             b"From: sender@example.com\r\n"
@@ -440,7 +432,8 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
         mail = FetchFallbackMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
 
-        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail), \
+                patch.object(mail, 'fetch', wraps=mail.fetch) as sequence_fetch:
             result = web_outlook_app.get_email_detail_imap_generic_result(
                 email_addr='user@example.com',
                 imap_password='secret',
@@ -450,12 +443,10 @@ class ImapFolderResolutionTests(unittest.TestCase):
                 provider='custom',
             )
 
-        self.assertTrue(result['success'])
-        self.assertEqual(result['email']['id'], '9')
-        self.assertEqual(result['email']['subject'], 'detail message')
-        self.assertIn('detail body', result['email']['body'])
+        self.assertFalse(result['success'])
+        sequence_fetch.assert_not_called()
 
-    def test_custom_imap_detail_falls_back_when_uid_fetch_returns_ok_without_payload(self):
+    def test_custom_imap_detail_does_not_fall_back_when_uid_fetch_has_no_payload(self):
         raw_email = (
             b"Subject: detail fallback payload\r\n"
             b"From: sender@example.com\r\n"
@@ -481,7 +472,8 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
         mail = EmptyUidFetchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
 
-        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail), \
+                patch.object(mail, 'fetch', wraps=mail.fetch) as sequence_fetch:
             result = web_outlook_app.get_email_detail_imap_generic_result(
                 email_addr='user@example.com',
                 imap_password='secret',
@@ -491,12 +483,10 @@ class ImapFolderResolutionTests(unittest.TestCase):
                 provider='custom',
             )
 
-        self.assertTrue(result['success'])
-        self.assertEqual(result['email']['id'], '9')
-        self.assertEqual(result['email']['subject'], 'detail fallback payload')
-        self.assertIn('detail body from sequence fetch', result['email']['body'])
+        self.assertFalse(result['success'])
+        sequence_fetch.assert_not_called()
 
-    def test_custom_imap_raw_fetch_uses_sequence_fallback_when_uid_fetch_has_no_payload(self):
+    def test_custom_imap_raw_fetch_does_not_fall_back_when_uid_fetch_has_no_payload(self):
         raw_email = (
             b"Subject: raw fallback payload\r\n"
             b"From: sender@example.com\r\n"
@@ -540,9 +530,9 @@ class ImapFolderResolutionTests(unittest.TestCase):
                 provider='custom',
             )
 
-        self.assertEqual(result, raw_email)
+        self.assertIsNone(result)
         self.assertEqual(mail.uid_fetch_calls, [('FETCH', ('9', '(RFC822)'))])
-        self.assertEqual(mail.sequence_fetch_calls, [('9', '(RFC822)')])
+        self.assertEqual(mail.sequence_fetch_calls, [])
         self.assertTrue(mail.logged_out)
 
     def test_custom_imap_uses_exists_count_when_search_returns_empty(self):
@@ -573,7 +563,7 @@ class ImapFolderResolutionTests(unittest.TestCase):
             def fetch(self, message_id, _query):
                 if str(message_id) == '1':
                     return 'OK', [(
-                        b'1 (FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                        b'1 (UID 101 FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
                         raw_email,
                     )]
                 return 'NO', [b'not found']
@@ -591,7 +581,8 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(len(result['emails']), 1)
-        self.assertEqual(result['emails'][0]['id'], '1')
+        self.assertEqual(result['emails'][0]['id'], '101')
+        self.assertEqual(result['emails'][0]['id_mode'], 'uid')
         self.assertEqual(result['emails'][0]['subject'], 'exists fallback')
 
     def test_is_imap_search_protocol_rejection_classifies_attempts(self):
@@ -633,7 +624,7 @@ class ImapFolderResolutionTests(unittest.TestCase):
             def fetch(self, message_id, _query):
                 if str(message_id) == '1':
                     return 'OK', [(
-                        b'1 (FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                        b'1 (UID 101 FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
                         raw_email,
                     )]
                 return 'NO', [b'not found']
@@ -651,7 +642,8 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(len(result['emails']), 1)
-        self.assertEqual(result['emails'][0]['id'], '1')
+        self.assertEqual(result['emails'][0]['id'], '101')
+        self.assertEqual(result['emails'][0]['id_mode'], 'uid')
         self.assertEqual(result['emails'][0]['subject'], 'search rejected fallback')
 
     def test_custom_imap_search_rejection_without_messages_still_fails(self):
@@ -767,10 +759,13 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
             def fetch(self, message_id, query):
                 self.fetch_calls.append((str(message_id), query))
-                return 'OK', [(
-                    b'2 (FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
-                    raw_email,
-                )]
+                data = []
+                for identifier in str(message_id).split(','):
+                    data.extend([(
+                        f'{identifier} (UID {int(identifier) + 100} FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" BODY[HEADER] {{128}}'.encode(),
+                        raw_email,
+                    ), b')'])
+                return 'OK', data
 
         first_mail = SearchTooLargeMail()
         second_mail = ReconnectedMail()
@@ -789,7 +784,7 @@ class ImapFolderResolutionTests(unittest.TestCase):
         self.assertEqual({item['subject'] for item in result['emails']}, {'too large fallback'})
         self.assertTrue(first_mail.logged_out)
         self.assertTrue(second_mail.logged_out)
-        self.assertEqual({call[0] for call in second_mail.fetch_calls}, {'1', '2'})
+        self.assertEqual([call[0] for call in second_mail.fetch_calls], ['2,1'])
 
     def test_custom_imap_search_too_large_reconnect_failure_keeps_error(self):
         class SearchTooLargeMail(FakeMail):
@@ -1054,7 +1049,7 @@ class ImapFolderResolutionTests(unittest.TestCase):
 
             def uid(self, command, message_id, query):
                 self.uid_calls.append((command, message_id, query))
-                return 'OK', [(b'7 (RFC822 {128}', raw_email)]
+                return 'OK', [(b'7 (UID 7 RFC822 {128}', raw_email)]
 
             def fetch(self, message_id, query):
                 self.fetch_calls.append((message_id, query))
@@ -2430,6 +2425,7 @@ class RefreshTokenProxyFallbackTests(unittest.TestCase):
         return response
 
     def setUp(self):
+        web_outlook_app.reset_graph_token_scope_cache()
         self.app = web_outlook_app.app
         self.app.config['TESTING'] = True
         self.app.config['WTF_CSRF_ENABLED'] = False
@@ -4018,6 +4014,8 @@ class MultiChannelForwardingTests(unittest.TestCase):
                 (self.account_id,),
             )
             db.commit()
+            # Legacy opt-ins are materialized before a job; polling only reads routes.
+            web_outlook_app.sync_legacy_forwarding()
 
     def tearDown(self):
         with self.app.app_context():
@@ -4091,6 +4089,7 @@ class MultiChannelForwardingTests(unittest.TestCase):
             web_outlook_app.set_setting('forward_keywords', 'Access deactivated')
             web_outlook_app.set_setting('forward_channels', 'smtp,telegram,wecom')
             web_outlook_app.set_setting_encrypted('wecom_webhook_url', 'https://example.com/robot')
+            web_outlook_app.sync_legacy_forwarding()
             config = web_outlook_app.build_forwarding_job_config()
             config.update(include_junkemail=False, forward_window_start=None)
             account = web_outlook_app.get_account_by_id(self.account_id)
@@ -4135,6 +4134,7 @@ class MultiChannelForwardingTests(unittest.TestCase):
                 with self.app.app_context():
                     db = web_outlook_app.get_db()
                     db.execute('DELETE FROM forward_logs')
+                    db.execute("DELETE FROM forwarding_events WHERE source_type='account' AND source_id=?", (self.account_id,))
                     db.execute('UPDATE accounts SET forward_last_checked_at = NULL WHERE id = ?', (self.account_id,))
                     db.commit()
                 details = {'failed': None if detail_fails else matching,
@@ -4143,6 +4143,12 @@ class MultiChannelForwardingTests(unittest.TestCase):
                 self.assertTrue(result['had_processing_failure'])
                 self.assertFalse(result['cursor_updated'])
                 details['failed'] = matching
+                with self.app.app_context():
+                    # Simulate the next eligible poll without waiting for the
+                    # persisted notification retry backoff in this unit test.
+                    db = web_outlook_app.get_db()
+                    db.execute("UPDATE forwarding_deliveries SET next_attempt_at=0 WHERE status='failed'")
+                    db.commit()
                 result, _, email_mock, tg_mock, wecom_mock = self._process_keyword_messages(items, details)
                 self.assertFalse(result['had_processing_failure'])
                 with self.app.app_context():
@@ -4337,6 +4343,7 @@ class MultiChannelForwardingTests(unittest.TestCase):
                 ('second-forward@example.com',),
             )
             db.commit()
+            web_outlook_app.sync_legacy_forwarding()
 
         with patch.object(web_outlook_app, 'fetch_forward_candidates', return_value={'success': True, 'emails': [], 'error': ''}) as candidates_mock:
             with patch.object(web_outlook_app.time, 'sleep') as sleep_mock:
@@ -4375,6 +4382,7 @@ class MultiChannelForwardingTests(unittest.TestCase):
                 ('parallel-second@example.com',),
             )
             db.commit()
+            web_outlook_app.sync_legacy_forwarding()
 
         first_started = threading.Event()
         second_processed = threading.Event()
@@ -4417,6 +4425,7 @@ class MultiChannelForwardingTests(unittest.TestCase):
                 ('parallel-delay-second@example.com',),
             )
             db.commit()
+            web_outlook_app.sync_legacy_forwarding()
 
         with patch.object(web_outlook_app, 'fetch_forward_candidates', return_value={'success': True, 'emails': [], 'error': ''}) as candidates_mock:
             with patch.object(web_outlook_app.time, 'sleep') as sleep_mock:

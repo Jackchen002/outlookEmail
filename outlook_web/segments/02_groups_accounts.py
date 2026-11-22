@@ -459,13 +459,15 @@ def normalize_account_pagination(limit: Any = None, offset: Any = 0) -> tuple[Op
 
 def normalize_account_sort(sort_by: Any = 'created_at', sort_order: Any = 'desc') -> tuple[str, str]:
     normalized_sort_by = str(sort_by or '').strip().lower()
-    if normalized_sort_by not in {'sort_order', 'created_at', 'email'}:
+    if normalized_sort_by not in {'sort_order', 'created_at', 'email', 'manual'}:
         normalized_sort_by = 'created_at'
 
     normalized_sort_order = str(sort_order or '').strip().lower()
     if normalized_sort_order not in {'asc', 'desc'}:
         normalized_sort_order = 'desc' if normalized_sort_by == 'created_at' else 'asc'
 
+    if normalized_sort_by == 'manual':
+        normalized_sort_order = 'asc'
     return normalized_sort_by, normalized_sort_order
 
 
@@ -473,6 +475,14 @@ def build_account_order_clause(sort_by: Any = 'created_at', sort_order: Any = 'd
     normalized_sort_by, normalized_sort_order = normalize_account_sort(sort_by, sort_order)
     direction = 'DESC' if normalized_sort_order == 'desc' else 'ASC'
 
+    if normalized_sort_by == 'manual':
+        return '''
+            ORDER BY
+                CASE WHEN COALESCE(a.manual_sort_order, 0) > 0 THEN 0 ELSE 1 END ASC,
+                a.manual_sort_order ASC,
+                CASE WHEN COALESCE(a.sort_order, 0) > 0 THEN 0 ELSE 1 END ASC,
+                a.sort_order ASC, a.created_at DESC, a.email COLLATE NOCASE ASC, a.id DESC
+        '''
     if normalized_sort_by == 'sort_order':
         return f'''
             ORDER BY
@@ -485,6 +495,33 @@ def build_account_order_clause(sort_by: Any = 'created_at', sort_order: Any = 'd
     if normalized_sort_by == 'email':
         return f'ORDER BY a.email COLLATE NOCASE {direction}, a.created_at DESC, a.id DESC'
     return f'ORDER BY a.created_at {direction}, a.email COLLATE NOCASE ASC, a.id DESC'
+
+
+def reorder_account(account_id: int, target_id: int, position: str) -> List[Dict[str, int]]:
+    """Move one account relative to another without changing numeric sort values.
+
+    Read and write under one lock so concurrent moves use the latest order. Moving
+    IDs, rather than replacing a visible page, preserves hidden accounts' order.
+    """
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        rows = db.execute(f"SELECT a.id, a.manual_sort_order FROM accounts a {build_account_order_clause('manual')}").fetchall()
+        ids = [row['id'] for row in rows]
+        if account_id not in ids or target_id not in ids:
+            raise ValueError('邮箱不存在，请刷新列表后重试')
+        ids.remove(account_id)
+        target_index = ids.index(target_id) + (1 if position == 'after' else 0)
+        ids.insert(target_index, account_id)
+        previous = {row['id']: row['manual_sort_order'] for row in rows}
+        changes = [(index, account_id) for index, account_id in enumerate(ids, 1)
+                   if previous[account_id] != index]
+        db.executemany('UPDATE accounts SET manual_sort_order = ? WHERE id = ?', changes)
+        db.commit()
+        return [{'id': account_id, 'manual_sort_order': index} for index, account_id in changes]
+    except Exception:
+        db.rollback()
+        raise
 
 
 def normalize_tag_filter_values(tag_ids: Any = None) -> List[int]:
@@ -816,6 +853,24 @@ def normalize_account_status(status: Any) -> str:
     return 'active'
 
 
+def normalize_graph_token_scope(scope: Any) -> str:
+    """归一化账号级 Graph Token scope；空值表示自动（依次回退并记住成功项）。"""
+    normalized = ' '.join(str(scope or '').split())
+    if normalized.lower() in {'auto', 'recommended', '自动'}:
+        return ''
+    return normalized
+
+
+def register_account_graph_token_scope_preference(account: Dict[str, Any]) -> None:
+    """为已解密的账号登记 scope，供页面请求和后台转发共用。"""
+    account['graph_token_scope'] = normalize_graph_token_scope(account.get('graph_token_scope'))
+    register_graph_token_scope_preference(
+        account.get('client_id', ''),
+        account.get('refresh_token', ''),
+        account['graph_token_scope'],
+    )
+
+
 # ==================== 标签管理 ====================
 
 def get_tags() -> List[Dict]:
@@ -971,6 +1026,10 @@ def validate_account_aliases(account_id: int, primary_email: str, aliases: List[
         if normalized == primary_normalized:
             errors.append(f'别名 {normalized} 不能与主邮箱相同')
             continue
+        if (get_db().execute('SELECT 1 FROM icloud_hme_aliases WHERE address=?', (normalized,)).fetchone()
+                and not get_db().execute('SELECT 1 FROM account_aliases WHERE account_id=? AND LOWER(alias_email)=? AND icloud_alias_id IS NULL', (account_id, normalized)).fetchone()):
+            errors.append(f'别名 {normalized} 由 iCloud 管理，请前往 iCloud 管理修改')
+            continue
         if email_exists_as_primary(normalized, exclude_account_id=account_id):
             errors.append(f'别名 {normalized} 已被其他主邮箱占用')
             continue
@@ -988,12 +1047,15 @@ def validate_account_aliases(account_id: int, primary_email: str, aliases: List[
 
 def replace_account_aliases(account_id: int, primary_email: str, aliases: List[str], db=None) -> tuple[bool, List[str], List[str]]:
     database = db or get_db()
+    managed = {row[0].lower() for row in database.execute(
+        'SELECT alias_email FROM account_aliases WHERE account_id=? AND icloud_alias_id IS NOT NULL', (account_id,))}
+    aliases = [alias for alias in aliases if normalize_email_address(alias) not in managed]
     cleaned_aliases, errors = validate_account_aliases(account_id, primary_email, aliases)
     if errors:
         return False, cleaned_aliases, errors
 
     try:
-        database.execute('DELETE FROM account_aliases WHERE account_id = ?', (account_id,))
+        database.execute('DELETE FROM account_aliases WHERE account_id = ? AND icloud_alias_id IS NULL', (account_id,))
         for alias_email in cleaned_aliases:
             database.execute(
                 '''
@@ -1026,6 +1088,7 @@ def resolve_account_record(row: sqlite3.Row, matched_alias: str = '',
         except Exception:
             pass
     account['provider'] = normalize_provider(account.get('provider'), account.get('email', ''))
+    register_account_graph_token_scope_preference(account)
     account['account_type'] = account.get('account_type') or get_provider_meta(
         account['provider'], account.get('email', '')
     ).get('account_type', 'outlook')
@@ -1094,19 +1157,20 @@ def resolve_account_by_address(email_addr: str) -> Optional[Dict]:
     if row:
         return resolve_account_record(row)
 
-    alias_row = db.execute(
-        '''
-        SELECT a.*, aa.alias_email AS matched_alias
-        FROM account_aliases aa
-        JOIN accounts a ON a.id = aa.account_id
-        WHERE LOWER(aa.alias_email) = ?
-        LIMIT 1
-        ''',
-        (normalized,)
-    ).fetchone()
-    if not alias_row:
-        return None
-    return resolve_account_record(alias_row, matched_alias=alias_row['matched_alias'])
+    manual_alias = db.execute('''SELECT a.*, aa.alias_email AS matched_alias FROM account_aliases aa
+        JOIN accounts a ON a.id=aa.account_id WHERE LOWER(aa.alias_email)=? AND aa.icloud_alias_id IS NULL LIMIT 1''', (normalized,)).fetchone()
+    if manual_alias:
+        return resolve_account_record(manual_alias, matched_alias=manual_alias['matched_alias'])
+
+    from outlook_web.icloud_store import ICloudStore
+    context = ICloudStore(db, get_cipher()).resolve(normalized)
+    if context:
+        row = db.execute('SELECT * FROM accounts WHERE id=?', (context['mailbox_account_id'],)).fetchone()
+        account = resolve_account_record(row, matched_alias=normalized)
+        account.update(context)
+        return account
+
+    return None
 
 
 def build_plus_fallback_emails(email_addr: str) -> List[str]:
@@ -1407,11 +1471,13 @@ def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optiona
         'group_name': account.get('group_name', '默认分组'),
         'group_color': account.get('group_color', '#666666'),
         'sort_order': normalize_account_sort_order(account.get('sort_order', 0)),
+        'manual_sort_order': normalize_account_sort_order(account.get('manual_sort_order', 0)),
         'remark': account.get('remark', ''),
         'status': account.get('status', 'active'),
         'account_type': account.get('account_type', 'outlook'),
         'provider': account.get('provider', 'outlook'),
         'authorization_type': get_account_authorization_type(account),
+        'graph_token_scope': normalize_graph_token_scope(account.get('graph_token_scope')),
         'forward_enabled': bool(account.get('forward_enabled')),
         'proxy_override_enabled': account_has_proxy_override(account),
         'last_refresh_at': refresh_state['last_refresh_at'],
@@ -1440,10 +1506,10 @@ def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optiona
 ACCOUNT_INSERT_SQL = '''
     INSERT OR IGNORE INTO accounts (
         email, password, client_id, refresh_token, group_id, sort_order, remark,
-        status, account_type, provider, imap_host, imap_port, imap_password, forward_enabled,
+        status, account_type, provider, graph_token_scope, imap_host, imap_port, imap_password, forward_enabled,
         forward_last_checked_at, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 '''
 
 
@@ -1453,7 +1519,7 @@ def build_account_insert_values(email_addr: str, password: str, client_id: str =
                                 imap_password: str = '', forward_enabled: bool = False,
                                 sort_order: Optional[int] = None, status: str = 'active',
                                 proxy_url: str = '', fallback_proxy_url_1: str = '',
-                                fallback_proxy_url_2: str = '') -> tuple:
+                                fallback_proxy_url_2: str = '', graph_token_scope: str = '') -> tuple:
     encrypted_password = encrypt_data(password) if password else password
     encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
     encrypted_imap_password = encrypt_data(imap_password) if imap_password else imap_password
@@ -1476,11 +1542,12 @@ def build_account_insert_values(email_addr: str, password: str, client_id: str =
         normalized_status,
         normalized_account_type,
         normalized_provider,
+        normalize_graph_token_scope(graph_token_scope),
         normalized_imap_host,
         normalized_imap_port,
         encrypted_imap_password,
         1 if forward_enabled else 0,
-        datetime.now(timezone.utc).isoformat() if forward_enabled else None,
+        datetime.now(timezone.utc).isoformat(),
         str(proxy_url or '').strip(),
         str(fallback_proxy_url_1 or '').strip(),
         str(fallback_proxy_url_2 or '').strip(),
@@ -1493,7 +1560,7 @@ def add_account(email_addr: str, password: str, client_id: str = '', refresh_tok
                 imap_password: str = '', forward_enabled: bool = False,
                 sort_order: Optional[int] = None, status: str = 'active',
                 proxy_url: str = '', fallback_proxy_url_1: str = '',
-                fallback_proxy_url_2: str = '') -> bool:
+                fallback_proxy_url_2: str = '', graph_token_scope: str = '') -> bool:
     """添加邮箱账号"""
     db = get_db()
     try:
@@ -1502,7 +1569,7 @@ def add_account(email_addr: str, password: str, client_id: str = '', refresh_tok
             email_addr, password, client_id, refresh_token, group_id, remark,
             account_type, provider, imap_host, imap_port, imap_password,
             forward_enabled, sort_order, status,
-            proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+            proxy_url, fallback_proxy_url_1, fallback_proxy_url_2, graph_token_scope
         ))
         db.commit()
         return db.total_changes > before_changes
@@ -1515,7 +1582,7 @@ def add_accounts_bulk(parsed_accounts: List[Dict[str, Any]], group_id: int = 1,
                       sort_order: Optional[int] = None, remark: str = '',
                       status: str = 'active', tag_ids: Optional[List[int]] = None,
                       proxy_url: str = '', fallback_proxy_url_1: str = '',
-                      fallback_proxy_url_2: str = '') -> Dict[str, int]:
+                      fallback_proxy_url_2: str = '', graph_token_scope: str = '') -> Dict[str, int]:
     """批量添加邮箱账号，单事务写入，重复邮箱自动跳过。"""
     if not parsed_accounts:
         return {'added_count': 0, 'skipped_count': 0}
@@ -1549,7 +1616,8 @@ def add_accounts_bulk(parsed_accounts: List[Dict[str, Any]], group_id: int = 1,
             normalized_status,
             proxy_url,
             fallback_proxy_url_1,
-            fallback_proxy_url_2
+            fallback_proxy_url_2,
+            graph_token_scope
         )
         for parsed in parsed_accounts
     ]
@@ -2075,7 +2143,8 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                    imap_host: str = '', imap_port: int = 993, imap_password: str = '',
                    forward_enabled: bool = False, proxy_url: str = '',
                    fallback_proxy_url_1: str = '', fallback_proxy_url_2: str = '',
-                   authorization_type: Optional[str] = None) -> bool:
+                   authorization_type: Optional[str] = None,
+                   graph_token_scope: Optional[str] = None) -> bool:
     """更新邮箱账号"""
     db = get_db()
     try:
@@ -2087,6 +2156,9 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
         normalized_proxy_url = str(proxy_url or '').strip()
         normalized_fallback_proxy_url_1 = str(fallback_proxy_url_1 or '').strip()
         normalized_fallback_proxy_url_2 = str(fallback_proxy_url_2 or '').strip()
+        normalized_graph_token_scope = (
+            None if graph_token_scope is None else normalize_graph_token_scope(graph_token_scope)
+        )
 
         current_account = db.execute(
             'SELECT forward_enabled, forward_last_checked_at, account_type, authorization_type FROM accounts WHERE id = ?',
@@ -2109,6 +2181,7 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                 SET email = ?, password = ?, client_id = ?, refresh_token = ?,
                     group_id = ?, sort_order = ?, remark = ?, status = ?, account_type = ?, provider = ?,
                     authorization_type = ?,
+                    graph_token_scope = COALESCE(?, graph_token_scope),
                     imap_host = ?, imap_port = ?, imap_password = ?, forward_enabled = ?,
                     forward_last_checked_at = ?, proxy_url = ?, fallback_proxy_url_1 = ?,
                     fallback_proxy_url_2 = ?, updated_at = CURRENT_TIMESTAMP
@@ -2116,7 +2189,8 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
             ''', (
                 email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, normalized_sort_order,
                 remark, status,
-                account_type, provider, effective_authorization_type, imap_host, imap_port, encrypted_imap_password, 1,
+                account_type, provider, effective_authorization_type, normalized_graph_token_scope,
+                imap_host, imap_port, encrypted_imap_password, 1,
                 datetime.now(timezone.utc).isoformat(), normalized_proxy_url,
                 normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
             ))
@@ -2126,6 +2200,7 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                 SET email = ?, password = ?, client_id = ?, refresh_token = ?,
                     group_id = ?, sort_order = ?, remark = ?, status = ?, account_type = ?, provider = ?,
                     authorization_type = ?,
+                    graph_token_scope = COALESCE(?, graph_token_scope),
                     imap_host = ?, imap_port = ?, imap_password = ?, forward_enabled = ?,
                     proxy_url = ?, fallback_proxy_url_1 = ?, fallback_proxy_url_2 = ?,
                     updated_at = CURRENT_TIMESTAMP
@@ -2133,10 +2208,13 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
             ''', (
                 email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, normalized_sort_order,
                 remark, status,
-                account_type, provider, effective_authorization_type, imap_host, imap_port, encrypted_imap_password, 1 if forward_enabled else 0,
+                account_type, provider, effective_authorization_type, normalized_graph_token_scope,
+                imap_host, imap_port, encrypted_imap_password, 1 if forward_enabled else 0,
                 normalized_proxy_url, normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
             ))
         db.commit()
+        if normalized_graph_token_scope is not None:
+            register_graph_token_scope_preference(client_id, refresh_token, normalized_graph_token_scope)
         return True
     except Exception:
         return False
@@ -2806,6 +2884,14 @@ def claim_project_account(project_key: str, caller_id: str, task_id: str, lease_
             WHERE pa.project_id = ?
               AND pa.status = 'toClaim'
               AND a.status = 'active'
+              AND (NOT EXISTS (SELECT 1 FROM icloud_hme_aliases h WHERE h.address=pa.normalized_email)
+                   OR LOWER(a.email)=pa.normalized_email
+                   OR EXISTS (SELECT 1 FROM account_aliases aa WHERE aa.account_id=pa.account_id
+                        AND LOWER(aa.alias_email)=pa.normalized_email AND aa.icloud_alias_id IS NULL)
+                   OR EXISTS (SELECT 1 FROM icloud_hme_aliases h JOIN account_aliases aa ON aa.icloud_alias_id=h.id
+                        JOIN icloud_accounts ia ON ia.id=h.account_id WHERE h.address=pa.normalized_email
+                          AND aa.account_id=pa.account_id AND h.state='active' AND h.conflict=''
+                          AND ia.enabled=1 AND ia.binding_lost=0))
               AND NOT EXISTS (
                     SELECT 1 FROM project_accounts pa2
                     WHERE pa2.account_id = pa.account_id
@@ -3588,6 +3674,7 @@ def set_account_forward_cursor(account_id: int, cursor_value: Optional[str]) -> 
             ''',
             (cursor_value, account_id)
         )
+        db.execute('INSERT INTO forwarding_replay_requests(account_id,requested_at) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET requested_at=excluded.requested_at', (account_id, time.time()))
         db.commit()
         return True
     except Exception:
