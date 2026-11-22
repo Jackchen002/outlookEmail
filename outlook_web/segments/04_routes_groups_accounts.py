@@ -2123,7 +2123,7 @@ def api_update_account(account_id):
     sort_order = parse_account_sort_order_input(data.get('sort_order')) if 'sort_order' in data else None
     remark = sanitize_input(data.get('remark', ''), max_length=200)
     status = data.get('status', 'active')
-    forward_enabled = bool(data.get('forward_enabled', False))
+    forward_enabled = bool(data.get('forward_enabled', current_account.get('forward_enabled', False)))
     proxy_url = str(data.get('proxy_url', current_account.get('proxy_url', '')) or '').strip()
     fallback_proxy_url_1 = str(
         data.get('fallback_proxy_url_1', current_account.get('fallback_proxy_url_1', '')) or ''

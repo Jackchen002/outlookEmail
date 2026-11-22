@@ -2614,10 +2614,11 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('settings.forward_parallel_workers = forwardParallelWorkers;', settings_js)
         self.assertIn("delayEl.value = '0';", settings_js)
         self.assertIn("forwardExecutionMode === 'parallel'", settings_js)
-        self.assertIn('id="settingForwardCheckIntervalSeconds"', extension_js)
-        self.assertIn('id="settingForwardExecutionMode"', extension_js)
-        self.assertIn('forward_check_interval_seconds: forwardCheckIntervalSeconds', extension_js)
-        self.assertIn('forward_account_delay_seconds: forwardAccountDelaySeconds', extension_js)
+        self.assertIn('id="btnManageForwarding"', extension_js)
+        self.assertIn('value="manage-forwarding"', extension_js)
+        self.assertIn("Api.openConsole(config, '/forwarding')", extension_js)
+        self.assertNotIn('forward_check_interval_seconds:', extension_js)
+        self.assertNotIn('/api/accounts/batch-update-forwarding', extension_js)
 
     def test_retention_status_poll_uses_backoff_constants(self):
         settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')

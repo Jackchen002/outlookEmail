@@ -595,7 +595,6 @@
       </div>
     `;
     target.innerHTML = `${pager}${accounts.map((account, index) => {
-      const forwardLabel = account.forward_enabled ? '关闭转发' : '开启转发';
       const aliases = Array.isArray(account.aliases) && account.aliases.length ? ` · 别名 ${account.aliases.length}` : '';
       const refreshStatus = account.last_refresh_status ? ` · Token ${account.last_refresh_status}` : '';
       const remark = account.remark ? ` · ${account.remark}` : '';
@@ -606,11 +605,11 @@
           ${renderTagPills(account.tags)}
           <div class="item-actions account-actions">
             <button class="small-btn" type="button" data-action="view-mails" data-email="${escapeHtml(account.email)}">邮件</button>
-            <select class="account-action-select" data-account-menu data-account-id="${escapeHtml(account.id)}" data-email="${escapeHtml(account.email)}" data-label="${escapeHtml(account.email)}" data-forward="${account.forward_enabled ? '1' : '0'}" aria-label="${escapeHtml(account.email)} 更多操作">
+            <select class="account-action-select" data-account-menu data-account-id="${escapeHtml(account.id)}" data-email="${escapeHtml(account.email)}" data-label="${escapeHtml(account.email)}" aria-label="${escapeHtml(account.email)} 更多操作">
               <option value="">更多操作</option>
               <option value="edit-account">编辑</option>
               <option value="tag-account">标签</option>
-              <option value="toggle-forward">${escapeHtml(forwardLabel)}</option>
+              <option value="manage-forwarding">管理转发规则</option>
               <option value="refresh-account">刷新 Token</option>
               <option value="copy">复制</option>
               <option value="delete-account">删除</option>
@@ -648,10 +647,17 @@
         accountId: select.dataset.accountId,
         email: select.dataset.email,
         label: select.dataset.label,
-        forward: select.dataset.forward,
         copy: select.dataset.email,
       },
     });
+  }
+
+  async function openForwarding(config) {
+    try {
+      await Api.openConsole(config, '/forwarding');
+    } catch (error) {
+      showMessage(Api.friendlyError(error), 'error');
+    }
   }
 
   async function handleAccountAction(config, button) {
@@ -662,16 +668,7 @@
     }
     if (action === 'edit-account') return showAccountEditor(config, button.dataset.accountId);
     if (action === 'tag-account') return showTagAssignment(config, 'account', button.dataset.accountId, button.dataset.label || '');
-    if (action === 'toggle-forward') {
-      const enable = button.dataset.forward !== '1';
-      return runAction(config, async () => {
-        await Api.apiRequest(config, '/api/accounts/batch-update-forwarding', {
-          method: 'POST',
-          body: { account_ids: [Number(button.dataset.accountId)], forward_enabled: enable },
-        });
-        await loadMailAccounts(config, mailState.groups);
-      }, '正在更新转发状态...');
-    }
+    if (action === 'manage-forwarding') return openForwarding(config);
     if (action === 'refresh-account') {
       return runAction(config, async () => {
         const payload = await Api.apiRequest(config, `/api/accounts/${button.dataset.accountId}/refresh`, {
@@ -726,7 +723,6 @@
           </div>
           <label><span>备注</span><input id="editRemark" value="${escapeHtml(account.remark || '')}"></label>
           <label><span>别名</span><textarea id="editAliases" placeholder="每行一个别名">${escapeHtml(aliases)}</textarea></label>
-          <label class="check-row"><input id="editForwardEnabled" type="checkbox" ${account.forward_enabled ? 'checked' : ''}><span>开启转发</span></label>
           <div class="toolbar wrap">
             <button id="btnSaveAccount" class="primary-btn" type="button">保存账号</button>
             <button id="btnOnlyStatusActive" class="secondary-btn" type="button">设为 active</button>
@@ -760,7 +756,6 @@
           sort_order: valueOf('editSortOrder'),
           remark: valueOf('editRemark'),
           status: valueOf('editStatus') || 'active',
-          forward_enabled: checked('editForwardEnabled'),
           aliases: valueOf('editAliases').split(/\r?\n|,/).map((item) => item.trim()).filter(Boolean),
         };
         if (passwordValue || !account.has_password) {
@@ -1304,7 +1299,6 @@
               <label><span>统一备注</span><input id="importRemark"></label>
               <label><span>状态</span><select id="importStatus">${renderOptions([['active', 'active'], ['inactive', 'inactive']], 'active')}</select></label>
             </div>
-            <label class="check-row"><input id="importForward" type="checkbox"><span>导入后开启转发</span></label>
             <div class="compact-box">
               <div class="item-meta">导入时绑定标签</div>
               ${tagCheckboxes(tags, [], 'importTagIds')}
@@ -1380,7 +1374,6 @@
           account_string: valueOf('importText'),
           imap_host: valueOf('importImapHost'),
           imap_port: toInt(valueOf('importImapPort'), 993),
-          forward_enabled: checked('importForward'),
           remark: valueOf('importRemark'),
           status: valueOf('importStatus') || 'active',
           tag_ids: tagIds,
@@ -1568,7 +1561,6 @@
             <label><span>账号密码</span><input id="oauthPasswordInput" type="password"></label>
           </div>
           <label><span>保存到分组</span><select id="tokenSaveGroup">${groupOptions(groups, defaultGroup, false)}</select></label>
-          <label class="check-row"><input id="oauthForwardEnabled" type="checkbox"><span>保存后开启转发</span></label>
           <label><span>授权后完整回调 URL</span><textarea id="redirectedUrl" placeholder="粘贴浏览器地址栏中的完整 URL"></textarea></label>
           <div class="toolbar wrap">
             <button id="btnExchangeToken" class="secondary-btn" type="button">换取并预览</button>
@@ -1580,7 +1572,7 @@
       getEl('btnCopyAuthUrl').addEventListener('click', () => copyText(getEl('authUrlText').value));
       getEl('btnExchangeToken').addEventListener('click', () => exchangeToken(config));
       getEl('btnSaveTokenAccount').addEventListener('click', () => saveTokenAccount(config));
-      ['oauthEmailInput', 'oauthPasswordInput', 'tokenSaveGroup', 'oauthForwardEnabled', 'redirectedUrl'].forEach((id) => {
+      ['oauthEmailInput', 'oauthPasswordInput', 'tokenSaveGroup', 'redirectedUrl'].forEach((id) => {
         const el = getEl(id);
         el?.addEventListener('input', () => { mailState.oauthPreview = null; });
         el?.addEventListener('change', () => { mailState.oauthPreview = null; });
@@ -1607,7 +1599,6 @@
         client_id: tokenPayload.client_id,
         refresh_token: tokenPayload.refresh_token,
         group_id: Number(valueOf('tokenSaveGroup')),
-        forward_enabled: checked('oauthForwardEnabled'),
       };
     }
     getEl('tokenResult').innerHTML = renderResult(tokenPayload);
@@ -1630,7 +1621,6 @@
           account_string: accountString,
           group_id: preview.group_id,
           provider: 'outlook',
-          forward_enabled: preview.forward_enabled,
         },
         timeoutMs: 70000,
       });
@@ -1864,12 +1854,6 @@
     await withSession(async (config) => {
       const payload = await Api.apiRequest(config, '/api/settings');
       const settings = payload.settings || {};
-      const forwardIntervalSeconds = settings.forward_check_interval_seconds
-        || String((toInt(settings.forward_check_interval_minutes || '5', 5) || 5) * 60);
-      const forwardExecutionMode = settings.forward_execution_mode === 'parallel' ? 'parallel' : 'serial';
-      const forwardAccountDelaySeconds = forwardExecutionMode === 'parallel'
-        ? '0'
-        : (settings.forward_account_delay_seconds || '0');
       setContent(`
         <div class="card">
           <div class="item-title">基础与刷新</div>
@@ -1897,39 +1881,7 @@
           <label><span>Cloudflare 管理密码</span><input id="settingCloudflareAdminPassword" type="password" value="${escapeHtml(settings.cloudflare_admin_password || '')}"></label>
         </div>
         <div class="card">
-          <div class="item-title">转发</div>
-          <div class="inline-checks">
-            <label class="check-row"><input name="settingForwardChannel" value="smtp" type="checkbox" ${Array.isArray(settings.forward_channels) && settings.forward_channels.includes('smtp') ? 'checked' : ''}><span>SMTP</span></label>
-            <label class="check-row"><input name="settingForwardChannel" value="telegram" type="checkbox" ${Array.isArray(settings.forward_channels) && settings.forward_channels.includes('telegram') ? 'checked' : ''}><span>Telegram</span></label>
-            <label class="check-row"><input name="settingForwardChannel" value="wecom" type="checkbox" ${Array.isArray(settings.forward_channels) && settings.forward_channels.includes('wecom') ? 'checked' : ''}><span>企业微信</span></label>
-          </div>
-          <div class="row">
-            <label><span>检查间隔（秒）</span><input id="settingForwardCheckIntervalSeconds" type="number" min="20" max="3600" value="${escapeHtml(forwardIntervalSeconds)}"></label>
-            <label><span>执行模式</span><select id="settingForwardExecutionMode">${renderOptions([['serial', '串行'], ['parallel', '并行']], forwardExecutionMode)}</select></label>
-          </div>
-          <div class="row">
-            <label><span>账号间隔（秒）</span><input id="settingForwardAccountDelay" type="number" min="0" max="60" value="${escapeHtml(forwardAccountDelaySeconds)}"></label>
-            <label><span>并行 worker</span><input id="settingForwardParallelWorkers" type="number" min="1" max="10" value="${escapeHtml(settings.forward_parallel_workers || '4')}"></label>
-          </div>
-          <div class="row">
-            <label><span>邮件时间窗口（分钟）</span><input id="settingForwardWindow" type="number" value="${escapeHtml(settings.forward_email_window_minutes || '0')}"></label>
-            <label><span>SMTP 类型</span><select id="settingSmtpProvider">${renderOptions(normalProviders.filter(([key]) => key !== 'gmail'), settings.smtp_provider || 'custom')}</select></label>
-          </div>
-          <label class="check-row"><input id="settingForwardJunk" type="checkbox" ${boolSetting(settings.forward_include_junkemail) ? 'checked' : ''}><span>转发垃圾箱邮件</span></label>
-          <label><span>SMTP 收件人</span><input id="settingForwardRecipient" value="${escapeHtml(settings.email_forward_recipient || '')}"></label>
-          <div class="row">
-            <label><span>SMTP 主机</span><input id="settingSmtpHost" value="${escapeHtml(settings.smtp_host || '')}"></label>
-            <label><span>SMTP 端口</span><input id="settingSmtpPort" type="number" value="${escapeHtml(settings.smtp_port || '465')}"></label>
-          </div>
-          <label><span>SMTP 用户名</span><input id="settingSmtpUsername" value="${escapeHtml(settings.smtp_username || '')}"></label>
-          <label><span>SMTP 密码</span><input id="settingSmtpPassword" type="password" value="${escapeHtml(settings.smtp_password || '')}"></label>
-          <label><span>SMTP 发件人</span><input id="settingSmtpFromEmail" value="${escapeHtml(settings.smtp_from_email || '')}"></label>
-          <label class="check-row"><input id="settingSmtpTls" type="checkbox" ${boolSetting(settings.smtp_use_tls) ? 'checked' : ''}><span>SMTP TLS</span></label>
-          <label class="check-row"><input id="settingSmtpSsl" type="checkbox" ${boolSetting(settings.smtp_use_ssl, true) ? 'checked' : ''}><span>SMTP SSL</span></label>
-          <label><span>Telegram Bot Token</span><input id="settingTelegramBotToken" type="password" value="${escapeHtml(settings.telegram_bot_token || '')}"></label>
-          <label><span>Telegram Chat ID</span><input id="settingTelegramChatId" value="${escapeHtml(settings.telegram_chat_id || '')}"></label>
-          <label><span>Telegram 代理</span><input id="settingTelegramProxyUrl" value="${escapeHtml(settings.telegram_proxy_url || '')}"></label>
-          <label><span>企业微信 Webhook</span><input id="settingWecomWebhookUrl" type="password" value="${escapeHtml(settings.wecom_webhook_url || '')}"></label>
+          <button id="btnManageForwarding" class="secondary-btn" type="button">打开转发管理</button>
         </div>
         <div class="card">
           <div class="item-title">WebDAV 备份</div>
@@ -1946,9 +1898,6 @@
           <div class="toolbar wrap">
             <button id="btnSaveSettings" class="primary-btn" type="button">保存设置</button>
             <button id="btnValidateRefreshCron" class="secondary-btn" type="button">校验刷新 Cron</button>
-            <button id="btnTestSmtp" class="secondary-btn" type="button">测试 SMTP</button>
-            <button id="btnTestTelegram" class="secondary-btn" type="button">测试 Telegram</button>
-            <button id="btnTestWecom" class="secondary-btn" type="button">测试企业微信</button>
             <button id="btnTestWebdav" class="secondary-btn" type="button">测试 WebDAV</button>
             <button id="btnUploadWebdav" class="secondary-btn" type="button">上传 WebDAV 备份</button>
           </div>
@@ -1957,30 +1906,13 @@
       `);
       getEl('btnSaveSettings').addEventListener('click', () => saveSettings(config));
       getEl('btnValidateRefreshCron').addEventListener('click', () => validateCron(config, valueOf('settingRefreshCron'), 5));
-      getEl('btnTestSmtp').addEventListener('click', () => testForwardChannel(config, 'smtp'));
-      getEl('btnTestTelegram').addEventListener('click', () => testForwardChannel(config, 'telegram'));
-      getEl('btnTestWecom').addEventListener('click', () => testForwardChannel(config, 'wecom'));
+      getEl('btnManageForwarding').addEventListener('click', () => openForwarding(config));
       getEl('btnTestWebdav').addEventListener('click', () => testWebdav(config));
       getEl('btnUploadWebdav').addEventListener('click', () => uploadWebdav(config));
-      const syncForwardExecutionMode = () => {
-        const modeEl = getEl('settingForwardExecutionMode');
-        const delayEl = getEl('settingForwardAccountDelay');
-        if (!modeEl || !delayEl) return;
-        const isParallel = modeEl.value === 'parallel';
-        delayEl.disabled = isParallel;
-        if (isParallel) {
-          delayEl.value = '0';
-        }
-      };
-      getEl('settingForwardExecutionMode')?.addEventListener('change', syncForwardExecutionMode);
-      syncForwardExecutionMode();
     }, '正在加载设置...');
   }
 
   function collectSettingsPayload() {
-    const forwardCheckIntervalSeconds = toInt(valueOf('settingForwardCheckIntervalSeconds'), 300);
-    const forwardExecutionMode = valueOf('settingForwardExecutionMode') === 'parallel' ? 'parallel' : 'serial';
-    const forwardAccountDelaySeconds = forwardExecutionMode === 'parallel' ? 0 : toInt(valueOf('settingForwardAccountDelay'), 0);
     return {
       gptmail_api_key: valueOf('settingGptmailKey'),
       app_timezone: valueOf('settingTimezone'),
@@ -1998,27 +1930,6 @@
       cloudflare_worker_domain: valueOf('settingCloudflareWorkerDomain'),
       cloudflare_email_domains: valueOf('settingCloudflareEmailDomains'),
       cloudflare_admin_password: valueOf('settingCloudflareAdminPassword'),
-      forward_channels: Array.from(document.querySelectorAll('[name="settingForwardChannel"]:checked')).map((item) => item.value),
-      forward_check_interval_seconds: forwardCheckIntervalSeconds,
-      forward_check_interval_minutes: Math.max(1, Math.min(60, Math.ceil(forwardCheckIntervalSeconds / 60))),
-      forward_execution_mode: forwardExecutionMode,
-      forward_parallel_workers: toInt(valueOf('settingForwardParallelWorkers'), 4),
-      forward_account_delay_seconds: forwardAccountDelaySeconds,
-      forward_email_window_minutes: valueOf('settingForwardWindow'),
-      forward_include_junkemail: checked('settingForwardJunk'),
-      email_forward_recipient: valueOf('settingForwardRecipient'),
-      smtp_host: valueOf('settingSmtpHost'),
-      smtp_port: valueOf('settingSmtpPort'),
-      smtp_username: valueOf('settingSmtpUsername'),
-      smtp_password: valueOf('settingSmtpPassword'),
-      smtp_from_email: valueOf('settingSmtpFromEmail'),
-      smtp_provider: valueOf('settingSmtpProvider'),
-      smtp_use_tls: checked('settingSmtpTls'),
-      smtp_use_ssl: checked('settingSmtpSsl'),
-      telegram_bot_token: valueOf('settingTelegramBotToken'),
-      telegram_chat_id: valueOf('settingTelegramChatId'),
-      telegram_proxy_url: valueOf('settingTelegramProxyUrl'),
-      wecom_webhook_url: valueOf('settingWecomWebhookUrl'),
       webdav_backup_enabled: checked('settingWebdavEnabled'),
       webdav_backup_url: valueOf('settingWebdavUrl'),
       webdav_backup_username: valueOf('settingWebdavUsername'),
@@ -2051,41 +1962,6 @@
       });
       getEl('settingsResult').innerHTML = renderResult(payload);
     }, '正在校验 Cron...');
-  }
-
-  function forwardTestConfig() {
-    return {
-      smtp: {
-        host: valueOf('settingSmtpHost'),
-        port: toInt(valueOf('settingSmtpPort'), 465),
-        username: valueOf('settingSmtpUsername'),
-        password: valueOf('settingSmtpPassword'),
-        from_email: valueOf('settingSmtpFromEmail'),
-        recipient: valueOf('settingForwardRecipient'),
-        provider: valueOf('settingSmtpProvider'),
-        use_tls: checked('settingSmtpTls'),
-        use_ssl: checked('settingSmtpSsl'),
-      },
-      telegram: {
-        bot_token: valueOf('settingTelegramBotToken'),
-        chat_id: valueOf('settingTelegramChatId'),
-        proxy_url: valueOf('settingTelegramProxyUrl'),
-      },
-      wecom: {
-        webhook_url: valueOf('settingWecomWebhookUrl'),
-      },
-    };
-  }
-
-  async function testForwardChannel(config, channel) {
-    await runAction(config, async () => {
-      const payload = await Api.apiRequest(config, '/api/settings/test-forward-channel', {
-        method: 'POST',
-        body: { channel, config: forwardTestConfig() },
-        timeoutMs: 70000,
-      });
-      getEl('settingsResult').innerHTML = renderResult(payload);
-    }, `正在测试 ${channel}...`);
   }
 
   function webdavConfig() {
